@@ -618,4 +618,13 @@ export const MeteoraClmmZapInRequest = Type.Object({
       default: false,
     }),
   ),
+  broadcastMode: Type.Optional(
+    Type.Union([Type.Literal('serial'), Type.Literal('fast')], {
+      description:
+        "'serial' (default): send each transaction and wait for on-chain confirmation before the next. " +
+        "'fast': sign the whole prebuilt sequence against one shared blockhash, broadcast all transactions " +
+        'back-to-back (targeting a single slot, like the Meteora frontend), then confirm the batch together.',
+      default: 'serial',
+    }),
+  ),
 });

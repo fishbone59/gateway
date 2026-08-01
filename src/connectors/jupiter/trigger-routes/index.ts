@@ -1,8 +1,8 @@
 import { Type, Static } from '@sinclair/typebox';
 import { FastifyPluginAsync } from 'fastify';
 
-import { getSolanaChainConfig } from '../../../chains/solana/solana.config';
 import { Solana } from '../../../chains/solana/solana';
+import { getSolanaChainConfig } from '../../../chains/solana/solana.config';
 import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 
@@ -135,7 +135,13 @@ export const jupiterTriggerRoutes: FastifyPluginAsync = async (fastify) => {
   // GET /auth/status — JWT cache state for a wallet (debug/monitoring)
   fastify.get(
     '/auth/status',
-    { schema: { description: 'Jupiter Trigger JWT cache status', tags: ['/connector/jupiter'], querystring: AuthStatusQuery } },
+    {
+      schema: {
+        description: 'Jupiter Trigger JWT cache status',
+        tags: ['/connector/jupiter'],
+        querystring: AuthStatusQuery,
+      },
+    },
     async (request) => {
       const { network, walletAddress } = request.query as Static<typeof AuthStatusQuery>;
       const client = await JupiterTriggerClient.getInstance(network);
@@ -146,7 +152,13 @@ export const jupiterTriggerRoutes: FastifyPluginAsync = async (fastify) => {
   // GET /vault — vault info or {vaultPubkey: null}
   fastify.get(
     '/vault',
-    { schema: { description: 'Get Jupiter Trigger vault for a wallet', tags: ['/connector/jupiter'], querystring: VaultQuery } },
+    {
+      schema: {
+        description: 'Get Jupiter Trigger vault for a wallet',
+        tags: ['/connector/jupiter'],
+        querystring: VaultQuery,
+      },
+    },
     async (request) => {
       const { network, walletAddress } = request.query as Static<typeof VaultQuery>;
       const client = await JupiterTriggerClient.getInstance(network);
@@ -158,7 +170,9 @@ export const jupiterTriggerRoutes: FastifyPluginAsync = async (fastify) => {
   // POST /vault/register — idempotent vault creation
   fastify.post(
     '/vault/register',
-    { schema: { description: 'Register Jupiter Trigger vault', tags: ['/connector/jupiter'], body: VaultRegisterBody } },
+    {
+      schema: { description: 'Register Jupiter Trigger vault', tags: ['/connector/jupiter'], body: VaultRegisterBody },
+    },
     async (request) => {
       const { network, walletAddress } = request.body as Static<typeof VaultRegisterBody>;
       if (!walletAddress) throw httpErrors.badRequest('walletAddress is required (no default wallet configured)');
@@ -197,8 +211,7 @@ export const jupiterTriggerRoutes: FastifyPluginAsync = async (fastify) => {
         inputAmountRaw = Math.floor(body.inputAmount! * 10 ** token.decimals).toString();
       }
 
-      const expiresAt =
-        body.expiresAt ?? Date.now() + Math.floor((body.expiresInHours ?? 24 * 7) * 60 * 60 * 1000);
+      const expiresAt = body.expiresAt ?? Date.now() + Math.floor((body.expiresInHours ?? 24 * 7) * 60 * 60 * 1000);
 
       const client = await JupiterTriggerClient.getInstance(network);
       try {

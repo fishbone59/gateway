@@ -61,6 +61,7 @@ export async function zapIn(
   cleanupOnly: boolean = false,
   lowerPrice?: number,
   upperPrice?: number,
+  broadcastMode: 'serial' | 'fast' = 'serial',
 ): Promise<ZapInResponseType> {
   const solana = await Solana.getInstance(network);
   const meteora = await Meteora.getInstance(network);
@@ -256,16 +257,97 @@ export async function zapIn(
   const signatures: string[] = [];
   let totalFee = 0;
   let zapInSignature: string | undefined;
-  for (const { label, tx, signers, cuOverride } of txSequence) {
-    tx.feePayer = wallet.publicKey;
-    logger.info(`Zap-in sending ${label} transaction (${tx.instructions.length} instructions)...`);
-    const { signature, fee } = await solana.sendAndConfirmTransaction(tx, signers, undefined, cuOverride);
-    logger.info(`Zap-in ${label} confirmed: ${signature}`);
-    if (label === 'zapIn') {
-      zapInSignature = signature;
+
+  if (broadcastMode === 'fast') {
+    // Fast path (frontend-like): the zap SDK prebuilds the whole sequence, so sign every
+    // transaction against one shared blockhash, broadcast them back-to-back without
+    // per-transaction confirm waits (targeting a single slot), then confirm the batch
+    // in one polling loop. Trade-off vs serial: an early on-chain failure also burns the
+    // later transactions' fees; resumeOnly/cleanupOnly remain the recovery path.
+    // CU overrides are pinned from observed mainnet consumption (serial mode measures
+    // each transaction post-confirmation, which is impossible pre-broadcast here).
+    const FAST_CU_OVERRIDES: Record<string, number> = {
+      setup: 60_000, // observed ~24k
+      ledger: 120_000, // observed ~27k
+    };
+    const SWAP_CU_OVERRIDE = 300_000; // observed 32k-105k depending on Jupiter route
+    const {
+      value: { blockhash, lastValidBlockHeight },
+    } = await connection.getLatestBlockhashAndContext('confirmed');
+    const priorityFee = await solana.estimateGasPrice();
+
+    const prepared = txSequence.map(({ label, tx, signers, cuOverride }) => {
+      const cu = cuOverride ?? FAST_CU_OVERRIDES[label] ?? (label.startsWith('swap') ? SWAP_CU_OVERRIDE : undefined);
+      if (tx instanceof Transaction) {
+        tx.feePayer = wallet.publicKey;
+      }
+      return { label, tx: solana.prepareForRapidBroadcast(tx, signers, blockhash, priorityFee, cu) };
+    });
+
+    // Pipelined broadcast: dispatch each send ~50ms apart WITHOUT awaiting the previous
+    // RPC response, so the whole burst reaches the leader within ~250ms (one slot) while
+    // preserving dispatch order. Awaiting each send serially costs ~1s/tx of RPC latency
+    // and smears the burst across several slots.
+    const sendPromises: Promise<string>[] = [];
+    for (const { label, tx } of prepared) {
+      sendPromises.push(solana.sendPreparedTransaction(tx));
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    signatures.push(signature);
-    totalFee += fee;
+    const settled = await Promise.allSettled(sendPromises);
+    settled.forEach((s, i) => {
+      if (s.status === 'fulfilled') {
+        const sig = s.value;
+        logger.info(`Zap-in fast: broadcast ${prepared[i].label} -> ${sig}`);
+        signatures.push(sig);
+        if (prepared[i].label === 'zapIn') {
+          zapInSignature = sig;
+        }
+      } else {
+        logger.error(`Zap-in fast: broadcast ${prepared[i].label} failed at RPC: ${s.reason?.message ?? s.reason}`);
+        signatures.push(''); // keep index alignment with prepared
+      }
+    });
+    const unsent = prepared.filter((_, i) => settled[i].status === 'rejected').map((p) => p.label);
+    if (unsent.length > 0) {
+      throw httpErrors.internalServerError(
+        `Zap-in fast broadcast failed at RPC for [${unsent.join(', ')}]; nothing after those was sent. ` +
+          `Sent signatures: ${signatures.filter(Boolean).join(', ')}`,
+      );
+    }
+
+    const results = await solana.confirmTransactionsBatch(signatures, lastValidBlockHeight);
+    results.forEach((r, i) => {
+      logger.info(
+        `Zap-in fast: ${prepared[i].label} ${r.signature} -> ${r.confirmed ? 'confirmed' : `FAILED (${r.error ?? 'expired'})`}`,
+      );
+    });
+    const failedLabels = prepared.filter((_, i) => !results[i].confirmed).map((p) => p.label);
+    if (failedLabels.length > 0) {
+      const confirmedLabels = prepared.filter((_, i) => results[i].confirmed).map((p) => p.label);
+      throw httpErrors.internalServerError(
+        `Zap-in fast broadcast incomplete: failed=[${failedLabels.join(', ')}], confirmed=[${confirmedLabels.join(', ')}]. ` +
+          (confirmedLabels.includes('ledger') && !confirmedLabels.includes('zapIn')
+            ? 'Ledger confirmed but position not opened — retry with resumeOnly=true. '
+            : '') +
+          (confirmedLabels.includes('zapIn') && !confirmedLabels.includes('cleanup')
+            ? 'Position opened but cleanup failed — run cleanupOnly=true to recover rent. '
+            : '') +
+          `Signatures: ${signatures.join(', ')}`,
+      );
+    }
+    totalFee = results.reduce((acc, r) => acc + (r.fee ?? 0), 0);
+  } else {
+    for (const { label, tx, signers, cuOverride } of txSequence) {
+      tx.feePayer = wallet.publicKey;
+      logger.info(`Zap-in sending ${label} transaction (${tx.instructions.length} instructions)...`);
+      const { signature, fee } = await solana.sendAndConfirmTransaction(tx, signers, undefined, cuOverride);
+      logger.info(`Zap-in ${label} confirmed: ${signature}`);
+      if (label === 'zapIn') {
+        zapInSignature = signature;
+      }
+      signatures.push(signature);
+      totalFee += fee;
+    }
   }
 
   logger.info(`Zap-in complete. Position: ${position.publicKey.toBase58()}, total fees: ${totalFee.toFixed(6)} SOL`);
@@ -322,6 +404,7 @@ export const zapInRoute: FastifyPluginAsync = async (fastify) => {
           cleanupOnly,
           lowerPrice,
           upperPrice,
+          broadcastMode,
         } = request.body;
 
         return await zapIn(
@@ -343,6 +426,7 @@ export const zapInRoute: FastifyPluginAsync = async (fastify) => {
           cleanupOnly,
           lowerPrice,
           upperPrice,
+          broadcastMode,
         );
       } catch (e) {
         logger.error(e);

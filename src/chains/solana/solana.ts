@@ -1401,6 +1401,106 @@ export class Solana {
   }
 
   /**
+   * Prepare a transaction for rapid (no-confirm-wait) broadcast: applies CU price/limit
+   * overrides (legacy transactions only — versioned transactions keep their SDK-provided
+   * budget, e.g. Jupiter swaps), pins a caller-supplied blockhash so a whole batch shares
+   * one validity window, and signs.
+   */
+  public prepareForRapidBroadcast(
+    tx: Transaction | VersionedTransaction,
+    signers: Signer[],
+    blockhash: string,
+    priorityFeePerCU: number,
+    computeUnitsOverride?: number,
+  ): Transaction | VersionedTransaction {
+    const microLamports = Math.floor(priorityFeePerCU * 1_000_000);
+    if (tx instanceof Transaction) {
+      tx.instructions = [
+        ...tx.instructions.filter((inst) => !Solana.isReplacedComputeBudgetInstruction(inst.programId, inst.data)),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports }),
+        ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitsOverride ?? this.config.defaultComputeUnits }),
+      ];
+      tx.recentBlockhash = blockhash;
+      tx.sign(...signers);
+      return tx;
+    }
+    (tx.message as any).recentBlockhash = blockhash;
+    tx.sign(signers);
+    return tx;
+  }
+
+  /**
+   * Serialize and broadcast an already-signed transaction WITHOUT waiting for confirmation.
+   * Pair with confirmTransactionsBatch to verify a whole batch afterwards.
+   */
+  public async sendPreparedTransaction(tx: Transaction | VersionedTransaction): Promise<string> {
+    const raw = tx.serialize();
+    return await this.connection.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 });
+  }
+
+  /**
+   * Confirm a batch of already-broadcast signatures with a single polling loop: one
+   * getSignatureStatuses call per tick covers the whole batch, so confirming N
+   * transactions costs the same wall time as confirming one.
+   */
+  public async confirmTransactionsBatch(
+    signatures: string[],
+    lastValidBlockHeight: number,
+    intervalMs = 400,
+    timeoutMs = 90_000,
+  ): Promise<{ signature: string; confirmed: boolean; error?: string; fee?: number }[]> {
+    const results = signatures.map((signature) => ({
+      signature,
+      confirmed: false,
+      error: undefined as string | undefined,
+      fee: undefined as number | undefined,
+    }));
+    const terminal = new Set<number>();
+    const start = Date.now();
+    let sawExpiredBlockhash = false;
+
+    while (Date.now() - start < timeoutMs && terminal.size < signatures.length) {
+      try {
+        const { value: statuses } = await this.connection.getSignatureStatuses(signatures);
+        statuses.forEach((st, i) => {
+          if (terminal.has(i) || !st) return;
+          if (st.err) {
+            results[i].error = JSON.stringify(st.err);
+            terminal.add(i);
+          } else if (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized') {
+            results[i].confirmed = true;
+            terminal.add(i);
+          }
+        });
+        if (terminal.size >= signatures.length) break;
+
+        const currentBlockHeight = await this.connection.getBlockHeight();
+        if (currentBlockHeight > lastValidBlockHeight) {
+          // Blockhash expired: outstanding transactions can no longer land. Grant one
+          // grace tick for the race where they landed in the final valid block.
+          if (sawExpiredBlockhash) break;
+          sawExpiredBlockhash = true;
+        }
+      } catch (pollingError: any) {
+        logger.warn(`Batch confirmation poll failed: ${pollingError.message}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+
+    // Attach fees for confirmed transactions (parallel, best-effort)
+    await Promise.all(
+      results.map(async (r) => {
+        if (!r.confirmed) return;
+        const txData = await this._fetchTransactionWithRetry(r.signature, 3, 400);
+        if (txData) {
+          r.fee = this.getFee(txData);
+        }
+      }),
+    );
+    return results;
+  }
+
+  /**
    * The 504 raised when a broadcast transaction was not seen on-chain before its blockhash
    * expired. Includes the signature so the caller can reconcile: the send raced the
    * confirmation window, and in rare cases the transaction may still show up.
