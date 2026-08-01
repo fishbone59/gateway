@@ -12,6 +12,7 @@ import { positionsOwnedRoute } from './positionsOwned';
 import { quotePositionRoute } from './quotePosition';
 import { quoteSwapRoute } from './quoteSwap';
 import { removeLiquidityRoute } from './removeLiquidity';
+import { zapInRoute } from './zapIn';
 
 export const meteoraClmmRoutes: FastifyPluginAsync = async (fastify) => {
   await fastify.register(fetchPoolsRoute);
@@ -22,6 +23,7 @@ export const meteoraClmmRoutes: FastifyPluginAsync = async (fastify) => {
   await fastify.register(quoteSwapRoute);
   await fastify.register(executeSwapRoute);
   await fastify.register(openPositionRoute);
+  await fastify.register(zapInRoute);
   await fastify.register(addLiquidityRoute);
   await fastify.register(removeLiquidityRoute);
   await fastify.register(collectFeesRoute);

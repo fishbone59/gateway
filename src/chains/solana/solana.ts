@@ -1285,42 +1285,49 @@ export class Solana {
     tx: Transaction | VersionedTransaction,
     signers: Signer[] = [],
     priorityFeePerCU?: number,
+    computeUnitsOverride?: number,
   ): Promise<{ signature: string; fee: number }> {
     // Use provided priority fee or estimate it
     const currentPriorityFee = priorityFeePerCU ?? (await this.estimateGasPrice());
 
-    // Always simulate transaction to get actual compute units
+    // Always simulate transaction to get actual compute units, unless an explicit override is given
+    // (CPI-heavy transactions can consume more on-chain than simulation reports)
     let computeUnitsToUse: number;
-    try {
-      let simulationResult;
+    if (computeUnitsOverride) {
+      computeUnitsToUse = computeUnitsOverride;
+      logger.info(`Using compute units override: ${computeUnitsOverride}`);
+    } else {
+      try {
+        let simulationResult;
 
-      if (tx instanceof Transaction) {
-        // For regular transactions, simulate with the Transaction object
-        const result = await this.connection.simulateTransaction(tx);
-        simulationResult = result.value;
-      } else {
-        // For versioned transactions, use the config object
-        const result = await this.connection.simulateTransaction(tx, {
-          replaceRecentBlockhash: true,
-          sigVerify: false,
-        });
-        simulationResult = result.value;
-      }
+        if (tx instanceof Transaction) {
+          // For regular transactions, simulate with the Transaction object
+          const result = await this.connection.simulateTransaction(tx);
+          simulationResult = result.value;
+        } else {
+          // For versioned transactions, use the config object
+          const result = await this.connection.simulateTransaction(tx, {
+            replaceRecentBlockhash: true,
+            sigVerify: false,
+          });
+          simulationResult = result.value;
+        }
 
-      if (simulationResult.unitsConsumed) {
-        // Add 10% margin for safety
-        computeUnitsToUse = Math.ceil(simulationResult.unitsConsumed * 1.1);
-        logger.info(
-          `Simulation consumed ${simulationResult.unitsConsumed} units, using ${computeUnitsToUse} with 10% margin`,
-        );
-      } else {
-        // Fallback to default if simulation doesn't return units
+        if (simulationResult.unitsConsumed) {
+          // Add 10% margin for safety
+          computeUnitsToUse = Math.ceil(simulationResult.unitsConsumed * 1.1);
+          logger.info(
+            `Simulation consumed ${simulationResult.unitsConsumed} units, using ${computeUnitsToUse} with 10% margin`,
+          );
+        } else {
+          // Fallback to default if simulation doesn't return units
+          computeUnitsToUse = this.config.defaultComputeUnits;
+          logger.warn('Simulation did not return units consumed, using default');
+        }
+      } catch (error) {
+        logger.warn(`Failed to simulate for compute units: ${error.message}, using default`);
         computeUnitsToUse = this.config.defaultComputeUnits;
-        logger.warn('Simulation did not return units consumed, using default');
       }
-    } catch (error) {
-      logger.warn(`Failed to simulate for compute units: ${error.message}, using default`);
-      computeUnitsToUse = this.config.defaultComputeUnits;
     }
 
     const basePriorityFeeLamports = currentPriorityFee * computeUnitsToUse;

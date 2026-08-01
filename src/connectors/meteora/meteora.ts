@@ -418,24 +418,31 @@ export class Meteora {
   }
 
   /** Gets raw position data without parsing */
-  async getRawPosition(positionAddress: string, wallet: PublicKey) {
-    const allPositions = await DLMM.getAllLbPairPositionsByUser(this.solana.connection, wallet);
-
-    const [matchingPosition] = Array.from(allPositions.values())
-      .map((position) => ({
-        position: position.lbPairPositionsData.find(
-          (lbPosition) => lbPosition.publicKey.toBase58() === positionAddress,
-        ),
-        info: position,
-      }))
-      .filter((x) => x.position);
-
-    if (!matchingPosition) {
+  async getRawPosition(positionAddress: string, _wallet: PublicKey) {
+    // Avoid DLMM.getAllLbPairPositionsByUser here: current @meteora-ag/dlmm can fail
+    // with "failed to get accounts owned by program ... Invalid params" on some RPCs.
+    // A position account embeds its lbPair at offset 8..40, so fetch the position directly.
+    const positionPubkey = new PublicKey(positionAddress);
+    const positionAccount = await this.solana.connection.getAccountInfo(positionPubkey);
+    if (!positionAccount) {
       return null;
     }
-    // console.log(matchingPosition);
 
-    return matchingPosition;
+    const lbPairPubkey = new PublicKey(positionAccount.data.slice(8, 40));
+    const dlmmPool = await this.getDlmmPool(lbPairPubkey.toBase58());
+    const position = await dlmmPool.getPosition(positionPubkey);
+    if (!position) {
+      return null;
+    }
+
+    return {
+      position: {
+        publicKey: positionPubkey,
+        positionData: position.positionData,
+        version: position.version,
+      },
+      info: { publicKey: lbPairPubkey },
+    };
   }
 
   /** Gets position information directly by position address (without needing wallet) */

@@ -8,6 +8,8 @@ export interface HttpClientOptions {
   timeout?: number;
   headers?: Record<string, string>;
   enableLogging?: boolean;
+  /** Optional undici dispatcher (e.g. Agent with allowH2 for HTTP/2-only endpoints) */
+  dispatcher?: any;
 }
 
 /**
@@ -78,12 +80,14 @@ export class HttpClient {
   private timeout: number;
   private defaultHeaders: Record<string, string>;
   private enableLogging: boolean;
+  private dispatcher?: any;
 
   constructor(options: HttpClientOptions) {
     this.baseURL = options.baseURL.replace(/\/$/, ''); // Remove trailing slash
     this.timeout = options.timeout ?? 30000;
     this.defaultHeaders = options.headers ?? {};
     this.enableLogging = options.enableLogging ?? false;
+    this.dispatcher = options.dispatcher;
   }
 
   /**
@@ -128,6 +132,9 @@ export class HttpClient {
         headers,
         signal: controller.signal,
       };
+      if (this.dispatcher) {
+        (fetchOptions as any).dispatcher = this.dispatcher;
+      }
 
       if (options?.body !== undefined) {
         fetchOptions.body = JSON.stringify(options.body);
@@ -210,6 +217,13 @@ export class HttpClient {
    */
   async put<T>(path: string, data?: any, options?: RequestOptions): Promise<HttpResponse<T>> {
     return this.request<T>('PUT', path, { ...options, body: data });
+  }
+
+  /**
+   * PATCH request
+   */
+  async patch<T>(path: string, data?: any, options?: RequestOptions): Promise<HttpResponse<T>> {
+    return this.request<T>('PATCH', path, { ...options, body: data });
   }
 
   /**

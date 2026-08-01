@@ -3,6 +3,7 @@ import type { FastifyPluginAsync } from 'fastify';
 
 // Import routes
 import { jupiterRouterRoutes } from './router-routes';
+import { jupiterTriggerRoutes } from './trigger-routes';
 
 // Jupiter routes with 4 endpoints
 const jupiterRouterRoutesWrapper: FastifyPluginAsync = async (fastify) => {
@@ -20,7 +21,14 @@ const jupiterRouterRoutesWrapper: FastifyPluginAsync = async (fastify) => {
   });
 };
 
+// Jupiter Trigger V2 routes (limit orders / TP-SL / OCO, local patch)
+const jupiterTriggerRoutesWrapper: FastifyPluginAsync = async (fastify) => {
+  await fastify.register(sensible);
+  await fastify.register(jupiterTriggerRoutes);
+};
+
 // Export routes in the same pattern as Raydium
 export const jupiterRoutes = {
   router: jupiterRouterRoutesWrapper,
+  trigger: jupiterTriggerRoutesWrapper,
 };

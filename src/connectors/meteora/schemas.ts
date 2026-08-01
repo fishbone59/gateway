@@ -500,3 +500,122 @@ export const MeteoraClmmQuotePositionRequest = Type.Object({
     }),
   ),
 });
+
+// Meteora CLMM Zap-In Request (single-token input, bundled swap + add liquidity via Meteora Zap program)
+export const MeteoraClmmZapInRequest = Type.Object({
+  network: Type.Optional(
+    Type.String({
+      description: 'Solana network to use',
+      default: solanaChainConfig.defaultNetwork,
+      enum: [...MeteoraConfig.networks],
+    }),
+  ),
+  walletAddress: Type.Optional(
+    Type.String({
+      description: 'Solana wallet address that will open the position',
+      default: solanaChainConfig.defaultWallet,
+      examples: [solanaChainConfig.defaultWallet],
+    }),
+  ),
+  poolAddress: Type.String({
+    description: 'Meteora DLMM pool address',
+    examples: [CLMM_POOL_ADDRESS_EXAMPLE],
+  }),
+  inputTokenMint: Type.Optional(
+    Type.String({
+      description: 'Input token mint address. Must be pool token X or token Y. Defaults to token X (base).',
+    }),
+  ),
+  amountIn: Type.Number({
+    description: 'UI amount of the input token to zap into the position',
+    examples: [0.5],
+  }),
+  minDeltaId: Type.Optional(
+    Type.Number({
+      description:
+        'Lower bin offset from the active bin (must be <= maxDeltaId). Required unless lowerPrice/upperPrice are given.',
+      examples: [-34],
+    }),
+  ),
+  maxDeltaId: Type.Optional(
+    Type.Number({
+      description: 'Upper bin offset from the active bin. Required unless lowerPrice/upperPrice are given.',
+      examples: [34],
+    }),
+  ),
+  lowerPrice: Type.Optional(
+    Type.Number({
+      description: 'Lower price bound (alternative to minDeltaId; converted to bin deltas against the active bin)',
+      examples: [75.4],
+    }),
+  ),
+  upperPrice: Type.Optional(
+    Type.Number({
+      description: 'Upper price bound (alternative to maxDeltaId; converted to bin deltas against the active bin)',
+      examples: [77.0],
+    }),
+  ),
+  strategyType: Type.Optional(
+    Type.Number({
+      description: 'Strategy type for the position (0 Spot, 1 Curve, 2 BidAsk)',
+      examples: [StrategyType.Spot],
+      enum: Object.values(StrategyType).filter((x) => typeof x === 'number'),
+    }),
+  ),
+  slippagePct: Type.Optional(
+    Type.Number({
+      minimum: 0,
+      maximum: 100,
+      description: 'Maximum acceptable swap slippage percentage',
+      default: MeteoraConfig.config.slippagePct,
+      examples: [MeteoraConfig.config.slippagePct],
+    }),
+  ),
+  maxActiveBinSlippage: Type.Optional(
+    Type.Number({
+      description: 'Maximum active-bin movement accepted by DLMM rebalance (bins)',
+      default: 50,
+    }),
+  ),
+  favorXInActiveId: Type.Optional(
+    Type.Boolean({
+      description: 'Whether the active bin allocation favors token X',
+      default: false,
+    }),
+  ),
+  maxAccounts: Type.Optional(
+    Type.Number({
+      description: 'Maximum accounts allowed in Jupiter swap route',
+      default: 50,
+    }),
+  ),
+  maxTransferAmountExtendPercentage: Type.Optional(
+    Type.Number({
+      description: 'Extra percentage buffer on max transfer amount',
+      default: 0,
+    }),
+  ),
+  estimateOnly: Type.Optional(
+    Type.Boolean({
+      description: 'If true, only run the swap estimate and return it without sending any transaction',
+      default: false,
+    }),
+  ),
+  resumeOnly: Type.Optional(
+    Type.Boolean({
+      description:
+        'Recovery mode: skip setup/swap/ledger transactions and only send zapIn + cleanup. ' +
+        'Use after a previous zap-in attempt timed out AFTER its ledger transaction confirmed ' +
+        '(tokens already swapped and balances recorded in the zap ledger PDA).',
+      default: false,
+    }),
+  ),
+  cleanupOnly: Type.Optional(
+    Type.Boolean({
+      description:
+        'Recovery mode: only send the cleanup transaction (close zap ledger PDA, recover rent, unwrap SOL). ' +
+        'Use after a previous attempt confirmed zapIn but failed on cleanup.',
+      default: false,
+    }),
+  ),
+});

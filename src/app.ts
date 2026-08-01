@@ -247,6 +247,9 @@ const configureGatewayServer = () => {
     app.register(jupiterRoutes.router, {
       prefix: '/connectors/jupiter/router',
     });
+    app.register(jupiterRoutes.trigger, {
+      prefix: '/connectors/jupiter/trigger',
+    });
 
     // Meteora routes
     app.register(meteoraRoutes.clmm, { prefix: '/connectors/meteora/clmm' });
