@@ -289,7 +289,7 @@ export async function zapIn(
     // preserving dispatch order. Awaiting each send serially costs ~1s/tx of RPC latency
     // and smears the burst across several slots.
     const sendPromises: Promise<string>[] = [];
-    for (const { label, tx } of prepared) {
+    for (const { tx } of prepared) {
       sendPromises.push(solana.sendPreparedTransaction(tx));
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
