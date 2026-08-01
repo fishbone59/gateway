@@ -10,3 +10,6 @@ slippagePct: 2
 # CurveBalanced = 4,
 # BidAskBalanced = 5
 strategyType: 0
+
+# Temporal (Nozomi) API key for broadcastMode=temporal zap-in (https://use.temporal.xyz)
+temporalApiKey: ''

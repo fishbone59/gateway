@@ -619,11 +619,11 @@ export const MeteoraClmmZapInRequest = Type.Object({
     }),
   ),
   broadcastMode: Type.Optional(
-    Type.Union([Type.Literal('serial'), Type.Literal('fast')], {
+    Type.Union([Type.Literal('serial'), Type.Literal('fast'), Type.Literal('temporal')], {
       description:
-        "'serial' (default): send each transaction and wait for on-chain confirmation before the next. " +
-        "'fast': sign the whole prebuilt sequence against one shared blockhash, broadcast all transactions " +
-        'back-to-back (targeting a single slot, like the Meteora frontend), then confirm the batch together.',
+        "'serial' (default): send each transaction and wait for on-chain confirmation before the next (slowest, step-precise errors). " +
+        "'fast': sign all prebuilt transactions against one shared blockhash, pipeline-broadcast without per-tx waits, batch-confirm, then verify deposited amounts (~4s, free, same-slot on a good run, ordering is best-effort). " +
+        "'temporal': same signing, but delivered via Temporal/Nozomi sendBatch in order over one request; requires temporalApiKey in conf/connectors/meteora.yml and costs 0.001 SOL tip per transaction (5 txs = 0.005 SOL).",
       default: 'serial',
     }),
   ),

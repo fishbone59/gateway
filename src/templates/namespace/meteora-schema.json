@@ -9,6 +9,10 @@
     "strategyType": {
       "type": "number",
       "description": "Default DLMM strategy type for positions"
+    },
+    "temporalApiKey": {
+      "type": "string",
+      "description": "Temporal (Nozomi) API key for broadcastMode=temporal zap-in"
     }
   },
   "additionalProperties": false,
