@@ -1,15 +1,8 @@
 import { Zap, estimateDlmmDirectSwap, DlmmSwapType } from '@meteora-ag/zap-sdk';
 import { DecimalUtil } from '@orca-so/common-sdk';
 import { Static, Type } from '@sinclair/typebox';
-import { Keypair, PublicKey, SystemProgram, Transaction, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
-import type {
-  AddressLookupTableAccount,
-  Connection,
-  MessageV0,
-  TransactionInstruction,
-} from '@solana/web3.js';
+import { Keypair, PublicKey, Transaction } from '@solana/web3.js';
 import { BN } from 'bn.js';
-import bs58 from 'bs58';
 import { Decimal } from 'decimal.js';
 import { FastifyPluginAsync } from 'fastify';
 
@@ -19,51 +12,38 @@ import { logger } from '../../../services/logger';
 import { Meteora } from '../meteora';
 import { MeteoraConfig } from '../meteora.config';
 import { MeteoraClmmZapInRequest } from '../schemas';
+import {
+  addNozomiTips,
+  deliverNozomiGated,
+  deliverPipelined,
+  DeliveryOutcome,
+  prepareSequence,
+  STATIC_PRIORITY_FEE,
+} from '../tx-delivery';
 
 const POOL_NOT_FOUND_MESSAGE = (poolAddress: string) => `Pool not found: ${poolAddress}`;
-// Temporal (Nozomi) transaction delivery. sendBatch forwards the whole sequence in order
-// over a single request — every transaction must carry its own >= 0.001 SOL tip transfer
-// to one of the public tip addresses (below-minimum tips are silently dropped).
-// https://use.temporal.xyz
-const NOZOMI_BATCH_URL = 'https://nozomi.temporal.xyz/api/sendBatch';
-const NOZOMI_TIP_LAMPORTS = 1_000_000; // 0.001 SOL per transaction (Nozomi default minimum)
-const NOZOMI_TIP_ADDRESSES = [
-  'TEMPaMeCRFAS9EKF53Jd6KpHxgL47uWLcpFArU1Fanq',
-  'noz3jAjPiHuBPqiSPkkugaJDkJscPuRhYnSpbi8UvC4',
-  'noz3str9KXfpKknefHji8L1mPgimezaiUyCHYMDv1GE',
-  'noz6uoYCDijhu1V7cutCpwxNiSovEwLdRHPwmgCGDNo',
-  'noz9EPNcT7WH6Sou3sr3GGjHQYVkN3DNirpbvDkv9YJ',
-  'nozc5yT15LazbLTFVZzoNZCwjh3yUtW86LoUyqsBu4L',
-  'nozFrhfnNGoyqwVuwPAW4aaGqempx4PU6g6D9CJMv7Z',
-  'nozievPk7HyK1Rqy1MPJwVQ7qQg2QoJGyP71oeDwbsu',
-  'noznbgwYnBLDHu8wcQVCEw6kDrXkPdKkydGJGNXGvL7',
-  'nozNVWs5N8mgzuD3qigrCG2UoKxZttxzZ85pvAQVrbP',
-  'nozpEGbwx4BcGp6pvEdAh1JoC2CQGZdU6HbNP1v2p6P',
-  'nozrhjhkCr3zXT3BiT4WCodYCUFeQvcdUkM7MqhKqge',
-  'nozrwQtWhEdrA6W8dkbt9gnUaMs52PdAv5byipnadq3',
-  'nozUacTVWub3cL4mJmGCYjKZTnE9RbdY5AP46iQgbPJ',
-  'nozWCyTPppJjRuw2fpzDhhWbW355fzosWSzrrMYB1Qk',
-  'nozWNju6dY353eMkMqURqwQEoM3SFgEKC6psLCSfUne',
-  'nozxNBgWohjR75vdspfxR5H9ceC7XXH99xpxhVGt3Bb',
-];
 
-/** Append an instruction to a signed-intent versioned (v0) transaction by decompiling,
- * adding the instruction and recompiling with the same address lookup tables. Caller
- * must (re-)sign afterwards. */
-async function appendInstructionToVersionedTx(
-  connection: Connection,
-  tx: VersionedTransaction,
-  ix: TransactionInstruction,
-): Promise<void> {
-  const msg = tx.message as MessageV0;
-  const lookups = (
-    await Promise.all(
-      msg.addressTableLookups.map((l) => connection.getAddressLookupTable(l.accountKey).then((r) => r.value)),
-    )
-  ).filter((a): a is AddressLookupTableAccount => !!a);
-  const compiled = TransactionMessage.decompile(msg, { addressLookupTableAccounts: lookups });
-  compiled.instructions.push(ix);
-  tx.message = compiled.compileToV0Message(lookups);
+// Short-TTL DLMM pool cache: repeated zap-ins on the same pool skip the SDK
+// initialization; refetchStates() refreshes the active bin / bin arrays so range
+// math always uses current state.
+const dlmmPoolCache = new Map<string, { pool: any; ts: number }>();
+const DLMM_POOL_CACHE_TTL_MS = 10_000;
+
+async function getDlmmPoolCached(meteora: Meteora, poolAddress: string): Promise<any> {
+  const hit = dlmmPoolCache.get(poolAddress);
+  if (hit && Date.now() - hit.ts < DLMM_POOL_CACHE_TTL_MS) {
+    try {
+      await hit.pool.refetchStates();
+      return hit.pool;
+    } catch {
+      // stale/broken entry — fall through to a fresh load
+    }
+  }
+  const pool = await meteora.getDlmmPool(poolAddress);
+  if (pool) {
+    dlmmPoolCache.set(poolAddress, { pool, ts: Date.now() });
+  }
+  return pool;
 }
 
 // Response schema (kept local: multi-transaction flow does not fit the shared CLMM single-signature schema)
@@ -137,7 +117,7 @@ export async function zapIn(
 
   let dlmmPool;
   try {
-    dlmmPool = await meteora.getDlmmPool(poolAddress);
+    dlmmPool = await getDlmmPoolCached(meteora, poolAddress);
     if (!dlmmPool) {
       throw httpErrors.notFound(POOL_NOT_FOUND_MESSAGE(poolAddress));
     }
@@ -305,163 +285,60 @@ export async function zapIn(
   // cleanup also runs CPI-heavy paths (close ledger + unwrap); pin a higher limit as well
   txSequence.push({ label: 'cleanup', tx: result.cleanUpTransaction, signers: [wallet], cuOverride: 400_000 });
 
-  const signatures: string[] = [];
-  let totalFee = 0;
-  let zapInSignature: string | undefined;
+  // 4. Deliver the sequence in the requested broadcast mode.
+  // serial:   per-tx sendAndConfirmTransaction (slowest, step-precise errors)
+  // fast:     shared blockhash + pipelined broadcast + batch confirm (~4s, order best-effort)
+  // temporal: shared blockhash + Nozomi confirm-gated sequential delivery (~5-8s, deterministic)
+  const recoveryHint = (_failed: string, confirmed: string[]): string =>
+    confirmed.includes('ledger') && !confirmed.includes('zapIn')
+      ? 'Ledger confirmed but position not opened — retry with resumeOnly=true.'
+      : confirmed.includes('zapIn') && !confirmed.includes('cleanup')
+        ? 'Position opened but cleanup failed — run cleanupOnly=true to recover rent.'
+        : 'Early step failed — wallet state unchanged apart from any confirmed setup ATAs.';
 
-  if (broadcastMode !== 'serial') {
-    // Fast path (frontend-like): the zap SDK prebuilds the whole sequence, so sign every
-    // transaction against one shared blockhash, then submit without per-transaction
-    // confirm waits and confirm the batch in one polling loop.
-    // 'fast': pipelined plain broadcast — quick, but intra-slot execution order is only
-    //   best-effort (a reorder once left the swap output unrecorded by the ledger).
-    // 'jito': Jito bundle — atomic, strictly ordered, single slot. Any failure drops the
-    //   whole bundle, so there is no intermediate state to recover; just retry.
-    // CU overrides are pinned from observed mainnet consumption (serial mode measures
-    // each transaction post-confirmation, which is impossible pre-broadcast here).
-    const FAST_CU_OVERRIDES: Record<string, number> = {
-      setup: 60_000, // observed ~24k
-      ledger: 120_000, // observed ~27k
-    };
-    const SWAP_CU_OVERRIDE = 300_000; // observed 32k-105k depending on Jupiter route
-    const {
-      value: { blockhash, lastValidBlockHeight },
-    } = await connection.getLatestBlockhashAndContext('confirmed');
-    const priorityFee = await solana.estimateGasPrice();
-
+  let delivery: DeliveryOutcome;
+  if (broadcastMode === 'serial') {
+    delivery = { signatures: [], results: [], totalFee: 0 };
+    for (const { label, tx, signers, cuOverride } of txSequence) {
+      tx.feePayer = wallet.publicKey;
+      logger.info(`Zap-in sending ${label} transaction (${(tx as Transaction).instructions?.length ?? '?'} instructions)...`);
+      const { signature, fee } = await solana.sendAndConfirmTransaction(tx, signers, undefined, cuOverride);
+      logger.info(`Zap-in ${label} confirmed: ${signature}`);
+      delivery.signatures.push(signature);
+      delivery.results.push({ signature, confirmed: true, fee });
+      delivery.totalFee += fee;
+      if (label === 'zapIn') {
+        delivery.keySignature = signature;
+      }
+    }
+  } else {
+    // Kick off blockhash (+ gas estimate for fast) BEFORE tip injection — the versioned-tx
+    // ALT fetches in addNozomiTips overlap with these RPCs. temporal uses a static priority
+    // fee: on Nozomi paths the tip is the lever, priority fee is ignored.
+    const blockhashPromise = connection.getLatestBlockhashAndContext('confirmed');
+    const gasPromise = broadcastMode === 'fast' ? solana.estimateGasPrice() : Promise.resolve(STATIC_PRIORITY_FEE);
     if (broadcastMode === 'temporal') {
-      // Nozomi requires EVERY transaction to carry its own >= 0.001 SOL tip transfer.
-      // Rotate tip addresses per transaction to avoid write-lock contention.
-      for (const entry of txSequence) {
-        const tipIx = SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: new PublicKey(NOZOMI_TIP_ADDRESSES[Math.floor(Math.random() * NOZOMI_TIP_ADDRESSES.length)]),
-          lamports: NOZOMI_TIP_LAMPORTS,
-        });
-        if (entry.tx instanceof Transaction) {
-          entry.tx.add(tipIx);
-        } else {
-          await appendInstructionToVersionedTx(connection, entry.tx, tipIx);
-        }
-      }
+      await addNozomiTips(connection, wallet.publicKey, txSequence);
     }
-
-    const prepared = txSequence.map(({ label, tx, signers, cuOverride }) => {
-      const cu = cuOverride ?? FAST_CU_OVERRIDES[label] ?? (label.startsWith('swap') ? SWAP_CU_OVERRIDE : undefined);
-      if (tx instanceof Transaction) {
-        tx.feePayer = wallet.publicKey;
-      }
-      return { label, tx: solana.prepareForRapidBroadcast(tx, signers, blockhash, priorityFee, cu) };
-    });
-
-    if (broadcastMode === 'temporal') {
-      // Confirm-gated sequential delivery through Nozomi (Temporal). Nozomi forwards a
-      // batch over parallel staked paths, so even a single-request batch does NOT
-      // preserve execution order at the leader (observed: zapIn executed before the
-      // ledger it depends on, in the same slot). The only robust fast pattern is:
-      // submit one transaction, wait for its confirmation, then submit the next.
-      // Nozomi lands each tx in ~1 slot, so the whole sequence takes ~5-8s with
-      // deterministic order. Each tx carries its own 0.001 SOL Nozomi tip.
-      const apiKey = MeteoraConfig.config.temporalApiKey;
-      if (!apiKey) {
-        throw httpErrors.internalServerError(
-          "broadcastMode=temporal requires 'temporalApiKey' in conf/connectors/meteora.yml",
-        );
-      }
-      const sigOf = (t: Transaction | VersionedTransaction): string =>
-        bs58.encode(t instanceof Transaction ? (t.signature as Buffer) : t.signatures[0]);
-      for (const p of prepared) {
-        const sig = sigOf(p.tx);
-        const raw = Buffer.from(p.tx.serialize() as Uint8Array);
-        const len = Buffer.alloc(2);
-        len.writeUInt16BE(raw.length, 0);
-        const body = Buffer.concat([len, raw] as unknown as Uint8Array[]);
-        const res = await fetch(`${NOZOMI_BATCH_URL}?c=${apiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/octet-stream' },
-          body,
-        });
-        if (!res.ok) {
-          const text = await res.text();
-          throw httpErrors.internalServerError(
-            `Zap-in temporal: Nozomi rejected ${p.label} (HTTP ${res.status}): ${text}. ` +
-              `Confirmed steps so far: [${signatures.length}].`,
-          );
-        }
-        signatures.push(sig);
-        if (p.label === 'zapIn') {
-          zapInSignature = sig;
-        }
-        const [result] = await solana.confirmTransactionsBatch([sig], lastValidBlockHeight);
-        if (!result.confirmed) {
-          throw httpErrors.internalServerError(
-            `Zap-in temporal: ${p.label} failed on-chain (${result.error ?? 'not confirmed before blockhash expiry'}). ` +
-              `Completed steps: [${signatures.length - 1}/5]. ` +
-              (p.label === 'cleanup'
-                ? 'Position is open — retry with cleanupOnly=true to recover the ledger rent.'
-                : p.label === 'zapIn'
-                  ? 'Ledger confirmed but position not opened — retry with resumeOnly=true.'
-                  : 'Early step failed — wallet state unchanged apart from any confirmed setup ATAs.'),
-          );
-        }
-        totalFee += result.fee ?? 0;
-        logger.info(`Zap-in temporal: ${p.label} confirmed (${sig})`);
-      }
-    } else {
-      // Pipelined broadcast: dispatch each send ~150ms apart WITHOUT awaiting the previous
-      // RPC response. The stagger must exceed leader-arrival jitter to keep execution
-      // order == dispatch order (a 50ms stagger once let the ledger execute before the
-      // swap: all txs confirmed yet only one side was deposited). ~0.6s total burst still
-      // lands the sequence in 1-2 slots.
-      const sendPromises: Promise<string>[] = [];
-      for (const { tx } of prepared) {
-        sendPromises.push(solana.sendPreparedTransaction(tx));
-        await new Promise((resolve) => setTimeout(resolve, 150));
-      }
-      const settled = await Promise.allSettled(sendPromises);
-      settled.forEach((s, i) => {
-        if (s.status === 'fulfilled') {
-          const sig = s.value;
-          logger.info(`Zap-in fast: broadcast ${prepared[i].label} -> ${sig}`);
-          signatures.push(sig);
-          if (prepared[i].label === 'zapIn') {
-            zapInSignature = sig;
-          }
-        } else {
-          logger.error(`Zap-in fast: broadcast ${prepared[i].label} failed at RPC: ${s.reason?.message ?? s.reason}`);
-          signatures.push(''); // keep index alignment with prepared
-        }
-      });
-      const unsent = prepared.filter((_, i) => settled[i].status === 'rejected').map((p) => p.label);
-      if (unsent.length > 0) {
-        throw httpErrors.internalServerError(
-          `Zap-in fast broadcast failed at RPC for [${unsent.join(', ')}]; nothing after those was sent. ` +
-            `Sent signatures: ${signatures.filter(Boolean).join(', ')}`,
-        );
-      }
-    }
-
-    const results = await solana.confirmTransactionsBatch(signatures, lastValidBlockHeight);
-    results.forEach((r, i) => {
-      logger.info(
-        `Zap-in fast: ${prepared[i].label} ${r.signature} -> ${r.confirmed ? 'confirmed' : `FAILED (${r.error ?? 'expired'})`}`,
-      );
-    });
-    const failedLabels = prepared.filter((_, i) => !results[i].confirmed).map((p) => p.label);
-    if (failedLabels.length > 0) {
-      const confirmedLabels = prepared.filter((_, i) => results[i].confirmed).map((p) => p.label);
-      throw httpErrors.internalServerError(
-        `Zap-in fast broadcast incomplete: failed=[${failedLabels.join(', ')}], confirmed=[${confirmedLabels.join(', ')}]. ` +
-          (confirmedLabels.includes('ledger') && !confirmedLabels.includes('zapIn')
-            ? 'Ledger confirmed but position not opened — retry with resumeOnly=true. '
-            : '') +
-          (confirmedLabels.includes('zapIn') && !confirmedLabels.includes('cleanup')
-            ? 'Position opened but cleanup failed — run cleanupOnly=true to recover rent. '
-            : '') +
-          `Signatures: ${signatures.join(', ')}`,
-      );
-    }
-    totalFee = results.reduce((acc, r) => acc + (r.fee ?? 0), 0);
+    const [
+      {
+        value: { blockhash, lastValidBlockHeight },
+      },
+      priorityFee,
+    ] = await Promise.all([blockhashPromise, gasPromise]);
+    const prepared = prepareSequence(solana, wallet.publicKey, txSequence, blockhash, priorityFee);
+    delivery =
+      broadcastMode === 'temporal'
+        ? await deliverNozomiGated(solana, prepared, lastValidBlockHeight, MeteoraConfig.config.temporalApiKey, {
+            flowName: 'Zap-in',
+            keyLabel: 'zapIn',
+            recoveryHint,
+          })
+        : await deliverPipelined(solana, prepared, lastValidBlockHeight, {
+            flowName: 'Zap-in',
+            keyLabel: 'zapIn',
+            recoveryHint,
+          });
 
     // Post-execution semantic verification: a same-slot reorder (e.g. the ledger executing
     // before the swap) leaves every transaction "confirmed" yet deposits only one side of
@@ -484,19 +361,11 @@ export async function zapIn(
       }
       logger.info(`Zap-in ${broadcastMode}: position verified (deposited X=${depX.toString()} Y=${depY.toString()})`);
     }
-  } else {
-    for (const { label, tx, signers, cuOverride } of txSequence) {
-      tx.feePayer = wallet.publicKey;
-      logger.info(`Zap-in sending ${label} transaction (${tx.instructions.length} instructions)...`);
-      const { signature, fee } = await solana.sendAndConfirmTransaction(tx, signers, undefined, cuOverride);
-      logger.info(`Zap-in ${label} confirmed: ${signature}`);
-      if (label === 'zapIn') {
-        zapInSignature = signature;
-      }
-      signatures.push(signature);
-      totalFee += fee;
-    }
   }
+
+  const signatures = delivery.signatures;
+  const totalFee = delivery.totalFee;
+  const zapInSignature = delivery.keySignature;
 
   logger.info(`Zap-in complete. Position: ${position.publicKey.toBase58()}, total fees: ${totalFee.toFixed(6)} SOL`);
 

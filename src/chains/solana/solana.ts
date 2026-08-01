@@ -1446,7 +1446,7 @@ export class Solana {
   public async confirmTransactionsBatch(
     signatures: string[],
     lastValidBlockHeight: number,
-    intervalMs = 400,
+    intervalMs = 200,
     timeoutMs = 90_000,
   ): Promise<{ signature: string; confirmed: boolean; error?: string; fee?: number }[]> {
     const results = signatures.map((signature) => ({
