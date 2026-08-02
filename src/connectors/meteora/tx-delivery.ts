@@ -1,11 +1,8 @@
+import { appendFileSync, mkdirSync } from 'fs';
+import { join } from 'path';
+
 import { PublicKey, SystemProgram, Transaction, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
-import type {
-  AddressLookupTableAccount,
-  Connection,
-  MessageV0,
-  Signer,
-  TransactionInstruction,
-} from '@solana/web3.js';
+import type { AddressLookupTableAccount, Connection, MessageV0, Signer, TransactionInstruction } from '@solana/web3.js';
 import bs58 from 'bs58';
 
 import { Solana } from '../../chains/solana/solana';
@@ -64,6 +61,10 @@ export interface DeliveryOptions {
   staggerMs?: number;
   /** Maps a failure to an actionable recovery hint (e.g. resumeOnly/cleanupOnly guidance) */
   recoveryHint?: (failedLabel: string, confirmedLabels: string[]) => string;
+  /** Attempt metadata (position address, pool, bins...) persisted right after bundle
+   * submission — if the process dies or the client disconnects after a landing, the
+   * position is recoverable from data/zapin-attempts.jsonl instead of tx archaeology. */
+  attemptRecord?: Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -71,14 +72,50 @@ export interface DeliveryOptions {
 // values pinned from observed mainnet consumption)
 
 export const DEFAULT_FAST_CU_OVERRIDES: Record<string, number> = {
-  setup: 60_000, // observed ~24k
-  ledger: 120_000, // observed ~27k
+  setup: 40_000, // measured ~24k
+  ledger: 50_000, // measured ~27k
 };
-export const SWAP_CU_OVERRIDE = 300_000; // observed 32k-105k depending on Jupiter route
+export const SWAP_CU_OVERRIDE = 150_000; // measured 24k-105k depending on Jupiter route
 
 /** Static priority fee for Nozomi delivery — on Nozomi paths the tip is the lever,
  * priority fee is essentially ignored (their docs: start with 100% of the bid in the tip). */
 export const STATIC_PRIORITY_FEE = 0.1; // lamports per CU
+
+// ---------------------------------------------------------------------------
+// Jito block engine — https://docs.jito.wtf/lowlatencytxnsend
+// A bundle is up to 5 transactions executed in ONE slot, strictly in order,
+// all-or-nothing — exactly the zap-in sequence semantics, with no reorder risk
+// and no intermediate state to recover (a failed bundle drops entirely).
+// One tip transfer to any of the 8 tip accounts is required per bundle (NOT per
+// tx), minimum 1000 lamports; check https://bundles.jito.wtf/api/v1/bundles/tip_floor
+// for the live auction floor. Auth: x-jito-auth header with the provisioned UUID
+// (default 2 req/s — keep polling at 1/s and leave headroom for sendBundle).
+// Land-rate tracking: every submission is appended to logs/jito-bundles.jsonl —
+// Jito requires >75% land rate for 7 days (with self-tracked logs) before any
+// rate-limit increase.
+
+export const JITO_TIP_FLOOR_URL = 'https://bundles.jito.wtf/api/v1/bundles/tip_floor';
+export const JITO_DEFAULT_API_URL = 'https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles';
+export const JITO_MAX_BUNDLE_SIZE = 5;
+export const JITO_DEFAULT_TIP_LAMPORTS = 10_000; // ~75th percentile of the tip floor
+export const JITO_DEFAULT_MAX_TIP_LAMPORTS = 200_000;
+/** tip_floor percentiles are dominated by small (1-2 tx, <200k CU) bundles, so the
+ * percentile value is scaled by bundle CU when pricing our much larger bundles —
+ * the auction effectively compares tip per unit of block space. */
+export const JITO_TIP_REFERENCE_CU = 200_000;
+export const JITO_TIP_SAFETY_FACTOR = 1.25;
+// Canonical tip accounts (stable, match getTipAccounts; hardcoded to save one
+// rate-limited request per zap-in).
+export const JITO_TIP_ACCOUNTS = [
+  'DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh',
+  'ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49',
+  'ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt',
+  'HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe',
+  'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY',
+  'DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL',
+  '3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT',
+  '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
+];
 
 // ---------------------------------------------------------------------------
 // Temporal (Nozomi) — https://use.temporal.xyz
@@ -297,5 +334,288 @@ export async function deliverNozomiGated(
     totalFee += result.fee ?? 0;
     logger.info(`${flow} temporal: ${p.label} confirmed (${sig})`);
   }
+  return { signatures, results, totalFee, keySignature };
+}
+
+// ---------------------------------------------------------------------------
+// Jito bundle delivery
+
+/** Append the single bundle tip transfer to the LAST transaction of the sequence
+ * (Jito requires one tip per bundle, not per tx). Rotate tip accounts to avoid
+ * write-lock contention with other searchers. */
+export async function addJitoTip(
+  connection: Connection,
+  payer: PublicKey,
+  sequence: LabeledTx[],
+  tipLamports: number = JITO_DEFAULT_TIP_LAMPORTS,
+): Promise<void> {
+  const last = sequence[sequence.length - 1];
+  const tipIx = SystemProgram.transfer({
+    fromPubkey: payer,
+    toPubkey: new PublicKey(JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]),
+    lamports: tipLamports,
+  });
+  if (last.tx instanceof Transaction) {
+    last.tx.add(tipIx);
+  } else {
+    await appendInstructionToVersionedTx(connection, last.tx, tipIx);
+  }
+}
+
+/** JSON-RPC call against the block engine with UUID auth. Retries on the
+ * rate-limit error (-32097) with linear backoff — the default quota is 2 req/s. */
+async function jitoRpc(method: string, params: unknown[], uuid: string, apiUrl: string, retries = 4): Promise<any> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-jito-auth': uuid },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    });
+    const json = await res.json();
+    if (json.error) {
+      const msg = JSON.stringify(json.error);
+      if ((json.error.code === -32097 || msg.includes('Rate limit')) && attempt < retries) {
+        await new Promise((r) => setTimeout(r, 1100 * (attempt + 1)));
+        continue;
+      }
+      throw new Error(`Jito ${method}: ${msg}`);
+    }
+    return json.result;
+  }
+}
+
+/** Current tip floor (lamports per percentile), fetched from bundles.jito.wtf —
+ * a separate host from the block engine, so these calls do NOT consume the
+ * 2 req/s UUID quota. Cached for 30s to avoid hammering on rapid retries. */
+interface JitoTipFloor {
+  p25: number;
+  p50: number;
+  p75: number;
+  p95: number;
+  p99: number;
+}
+let tipFloorCache: { at: number; floor: JitoTipFloor } | null = null;
+
+async function fetchJitoTipFloor(): Promise<JitoTipFloor | null> {
+  if (tipFloorCache && Date.now() - tipFloorCache.at < 30_000) {
+    return tipFloorCache.floor;
+  }
+  try {
+    const res = await fetch(JITO_TIP_FLOOR_URL, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) {
+      return tipFloorCache?.floor ?? null;
+    }
+    const d = (await res.json())?.[0];
+    if (!d) {
+      return tipFloorCache?.floor ?? null;
+    }
+    const toLamports = (sol: number) => Math.ceil((sol ?? 0) * 1e9);
+    const floor: JitoTipFloor = {
+      p25: toLamports(d.landed_tips_25th_percentile),
+      p50: toLamports(d.landed_tips_50th_percentile),
+      p75: toLamports(d.landed_tips_75th_percentile),
+      p95: toLamports(d.landed_tips_95th_percentile),
+      p99: toLamports(d.landed_tips_99th_percentile),
+    };
+    tipFloorCache = { at: Date.now(), floor };
+    return floor;
+  } catch {
+    return tipFloorCache?.floor ?? null;
+  }
+}
+
+/** Resolve the tip for one bundle. staticTip > 0 wins (fixed pricing). Otherwise
+ * dynamic: p75 of the live tip floor, scaled by the bundle's total CU relative to
+ * a small reference bundle (auction competition is per unit of block space — our
+ * 5-tx ~2.3M CU zap-in bundle lost auctions repeatedly at a flat 10k tip), times
+ * a safety factor, clamped to [1000, maxTip]. Falls back to JITO_DEFAULT_TIP_LAMPORTS
+ * when the floor API is unreachable. */
+export async function resolveJitoTipLamports(staticTip: number, totalCu: number, maxTip: number): Promise<number> {
+  if (staticTip > 0) {
+    return staticTip;
+  }
+  const floor = await fetchJitoTipFloor();
+  if (!floor || floor.p75 <= 0) {
+    logger.warn('Jito tip floor unavailable, falling back to static default tip');
+    return JITO_DEFAULT_TIP_LAMPORTS;
+  }
+  const cuFactor = Math.max(1, totalCu / JITO_TIP_REFERENCE_CU);
+  const tip = Math.ceil(floor.p75 * cuFactor * JITO_TIP_SAFETY_FACTOR);
+  const clamped = Math.min(Math.max(tip, 1_000), maxTip);
+  logger.info(
+    `Jito dynamic tip: p75=${floor.p75} lamports x CU factor ${cuFactor.toFixed(1)} (${totalCu} CU) x ${JITO_TIP_SAFETY_FACTOR} = ${tip} (clamped: ${clamped})`,
+  );
+  return clamped;
+}
+
+/** Append one land-rate record — Jito requires self-tracked land-rate logs
+ * (>75% over 7 days) for any future rate-limit increase. Kept in data/ (NOT
+ * logs/ — `pnpm clean` wipes logs/, which would destroy the 7-day evidence). */
+function logJitoLand(record: Record<string, unknown>): void {
+  try {
+    mkdirSync(join(process.cwd(), 'data'), { recursive: true });
+    appendFileSync(join(process.cwd(), 'data', 'jito-bundles.jsonl'), JSON.stringify(record) + '\n');
+  } catch (e) {
+    logger.warn(`Jito land-rate log write failed: ${(e as Error).message}`);
+  }
+}
+
+/** Persist a zap attempt (position address, pool, bins, bundleId, signatures)
+ * IMMEDIATELY after bundle submission. If the process dies or the client
+ * disconnects before the response, the position is recoverable from this file —
+ * an untracked position would have no lp_executor watching it (no out-of-range
+ * close, no take-profit/stop-loss). */
+function logZapAttempt(record: Record<string, unknown>): void {
+  try {
+    mkdirSync(join(process.cwd(), 'data'), { recursive: true });
+    appendFileSync(join(process.cwd(), 'data', 'zapin-attempts.jsonl'), JSON.stringify(record) + '\n');
+  } catch (e) {
+    logger.warn(`Zap attempt log write failed: ${(e as Error).message}`);
+  }
+}
+
+/**
+ * Jito bundle delivery: the whole sequence (<= 5 txs) executes in ONE slot,
+ * strictly in order, all-or-nothing. There is no reorder risk and no partial
+ * state — a non-landed bundle changes nothing on-chain, so recovery is simply
+ * "retry". Costs one tip (default 10k lamports) for the whole bundle instead of
+ * 0.001 SOL per transaction on the temporal path.
+ */
+export async function deliverJitoBundle(
+  solana: Solana,
+  prepared: PreparedTx[],
+  lastValidBlockHeight: number,
+  uuid: string,
+  tipLamports: number = JITO_DEFAULT_TIP_LAMPORTS,
+  apiUrl: string = JITO_DEFAULT_API_URL,
+  opts: DeliveryOptions = {},
+): Promise<DeliveryOutcome> {
+  const flow = opts.flowName ?? 'Flow';
+  if (!uuid) {
+    throw httpErrors.internalServerError(
+      `${flow} jito delivery requires a block-engine UUID (meteora.jitoUuid in conf/connectors/meteora.yml).`,
+    );
+  }
+  if (prepared.length > JITO_MAX_BUNDLE_SIZE) {
+    throw httpErrors.internalServerError(
+      `${flow} jito: sequence has ${prepared.length} transactions, exceeding the bundle max of ${JITO_MAX_BUNDLE_SIZE}. ` +
+        'Use broadcastMode serial/fast/temporal instead.',
+    );
+  }
+
+  const signatures = prepared.map((p) => signatureOf(p.tx));
+  const keySignature = prepared.find((p) => p.label === opts.keyLabel)
+    ? signatures[prepared.findIndex((p) => p.label === opts.keyLabel)]
+    : undefined;
+  const encoded = prepared.map((p) => Buffer.from(p.tx.serialize() as Uint8Array).toString('base64'));
+  const submittedAt = Date.now();
+
+  const bundleId = await jitoRpc('sendBundle', [encoded, { encoding: 'base64' }], uuid, apiUrl);
+  logger.info(`${flow} jito: bundle ${bundleId} submitted (${prepared.length} txs, tip ${tipLamports} lamports)`);
+  if (opts.attemptRecord) {
+    logZapAttempt({ ts: new Date(submittedAt).toISOString(), ...opts.attemptRecord, bundleId, signatures });
+  }
+
+  // Landing detection via our own RPC (Shyft): a landed bundle means every one of
+  // its transactions confirms, typically within 1-3 slots. Jito's own status
+  // endpoints are best-effort telemetry with cross-region/indexing lag (observed:
+  // getInflightBundleStatuses reports "Invalid" for bundles that landed fine,
+  // getBundleStatuses lags the landing by several seconds) — so they are used
+  // ONLY as a backstop for the land-rate log, never for control flow. This also
+  // leaves the full 2 req/s Jito quota available for sendBundle.
+  //
+  // A bundle can land at ANY point while its blockhash is valid — so "Dropped" is
+  // only authoritative once lastValidBlockHeight has passed (~60-90s). Declaring
+  // earlier risks the caller retrying and the first bundle landing late: two
+  // positions, the first one invisible to any automation.
+  let status = 'Dropped';
+  let landedSlot: number | null = null;
+  let txError: string | undefined;
+  // Wall-clock backstop: the normal exit is blockhash expiry, but if our RPC
+  // fails persistently (getBlockHeight keeps catching to 0) the loop must not
+  // hang the request forever.
+  const confirmDeadline = submittedAt + 150_000;
+  for (;;) {
+    const statuses = await solana.connection.getSignatureStatuses(signatures);
+    const vals = statuses?.value ?? [];
+    const confirmedCount = vals.filter(
+      (v) => v && !v.err && (v.confirmationStatus === 'confirmed' || v.confirmationStatus === 'finalized'),
+    ).length;
+    if (confirmedCount === signatures.length) {
+      status = 'Landed';
+      landedSlot = Math.max(...vals.map((v) => v?.slot ?? 0)) || null;
+      break;
+    }
+    const failed = vals.find((v) => v && v.err);
+    if (failed) {
+      // A landed bundle executes atomically, so a tx error here means the bundle
+      // landed and failed on-chain (e.g. slippage) — NOT a drop.
+      status = 'Failed';
+      txError = JSON.stringify(failed.err);
+      landedSlot = failed.slot ?? null;
+      break;
+    }
+    const blockHeight = await solana.connection.getBlockHeight('confirmed').catch(() => 0);
+    if (blockHeight > lastValidBlockHeight || Date.now() > confirmDeadline) {
+      break; // blockhash expired (or wall-clock backstop) — the bundle can no longer land
+    }
+    await new Promise((r) => setTimeout(r, 800));
+  }
+  if (status === 'Dropped') {
+    // Backstop: our RPC may lag — check Jito's landed record once before
+    // declaring the (already authoritative) drop, enriching the land-rate log.
+    const landed = await jitoRpc('getBundleStatuses', [[bundleId]], uuid, apiUrl).catch(() => null);
+    const entry = landed?.value?.[0];
+    if (entry) {
+      if (entry.err && entry.err.Ok === null) {
+        status = 'Landed';
+        landedSlot = entry.slot ?? null;
+      } else {
+        status = 'Failed';
+        txError = JSON.stringify(entry.err);
+        landedSlot = entry.slot ?? null;
+      }
+    }
+  }
+  const latencyMs = Date.now() - submittedAt;
+  logJitoLand({
+    ts: new Date(submittedAt).toISOString(),
+    flow,
+    bundleId,
+    signatures,
+    tipLamports,
+    status,
+    landedSlot,
+    latencyMs,
+  });
+
+  if (status !== 'Landed') {
+    throw httpErrors.internalServerError(
+      status === 'Failed'
+        ? `${flow} jito: bundle ${bundleId} landed but failed on-chain (${txError ?? 'unknown error'}). ` +
+            'Bundles are atomic — the failed transaction reverted the whole bundle; nothing changed on-chain. ' +
+            'Fix the cause (e.g. slippage) and retry. ' +
+            `Signatures (unused): ${signatures.join(', ')}`
+        : `${flow} jito: bundle ${bundleId} not landed before blockhash expiry — authoritative drop, retry is safe. ` +
+            'Bundles are atomic — nothing changed on-chain. ' +
+            `Signatures (unused): ${signatures.join(', ')}`,
+    );
+  }
+  logger.info(`${flow} jito: bundle landed at slot ${landedSlot} in ${latencyMs}ms`);
+
+  // Bundle landed => every tx is on-chain in order; collect fees via the shared
+  // batch confirmation (already confirmed, so this is one status+fee fetch pass).
+  const results = await solana.confirmTransactionsBatch(signatures, lastValidBlockHeight);
+  results.forEach((r, i) => {
+    logger.info(
+      `${flow} jito: ${prepared[i].label} ${r.signature} -> ${r.confirmed ? 'confirmed' : `FAILED (${r.error ?? 'expired'})`}`,
+    );
+  });
+  const unconfirmed = prepared.filter((_, i) => !results[i].confirmed).map((p) => p.label);
+  if (unconfirmed.length > 0) {
+    // Should not happen for a landed bundle — treat as data inconsistency, not partial state.
+    logger.error(`${flow} jito: bundle landed but [${unconfirmed.join(', ')}] not found confirmed on-chain`);
+  }
+  const totalFee = results.reduce((acc, r) => acc + (r.fee ?? 0), 0);
   return { signatures, results, totalFee, keySignature };
 }

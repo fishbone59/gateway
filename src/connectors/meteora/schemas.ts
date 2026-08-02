@@ -619,11 +619,12 @@ export const MeteoraClmmZapInRequest = Type.Object({
     }),
   ),
   broadcastMode: Type.Optional(
-    Type.Union([Type.Literal('serial'), Type.Literal('fast'), Type.Literal('temporal')], {
+    Type.Union([Type.Literal('serial'), Type.Literal('fast'), Type.Literal('temporal'), Type.Literal('jito')], {
       description:
         "'serial' (default): send each transaction and wait for on-chain confirmation before the next (slowest, step-precise errors). " +
         "'fast': sign all prebuilt transactions against one shared blockhash, pipeline-broadcast without per-tx waits, batch-confirm, then verify deposited amounts (~4s, free, same-slot on a good run, ordering is best-effort). " +
-        "'temporal': same signing, but delivered via Temporal/Nozomi sendBatch in order over one request; requires temporalApiKey in conf/connectors/meteora.yml and costs 0.001 SOL tip per transaction (5 txs = 0.005 SOL).",
+        "'temporal': same signing, but delivered via Temporal/Nozomi sendBatch in order over one request; requires temporalApiKey in conf/connectors/meteora.yml and costs 0.001 SOL tip per transaction (5 txs = 0.005 SOL). " +
+        "'jito': the whole sequence (max 5 txs) as ONE Jito bundle — single slot, strictly ordered, all-or-nothing; requires jitoUuid in conf/connectors/meteora.yml and one bundle tip (jitoTipLamports, default 10000 lamports).",
       default: 'serial',
     }),
   ),

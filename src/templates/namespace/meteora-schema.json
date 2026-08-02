@@ -13,6 +13,22 @@
     "temporalApiKey": {
       "type": "string",
       "description": "Temporal (Nozomi) API key for broadcastMode=temporal zap-in"
+    },
+    "jitoUuid": {
+      "type": "string",
+      "description": "Jito block-engine JSON-RPC UUID (x-jito-auth header) for broadcastMode=jito zap-in"
+    },
+    "jitoTipLamports": {
+      "type": "number",
+      "description": "Tip per Jito bundle in lamports (min 1000; 0 = dynamic: tip_floor p75 scaled by bundle CU)"
+    },
+    "jitoTipMaxLamports": {
+      "type": "number",
+      "description": "Cap for dynamic Jito tip pricing (default 200000)"
+    },
+    "jitoBlockEngine": {
+      "type": "string",
+      "description": "Regional Jito block-engine JSON-RPC URL for broadcastMode=jito zap-in"
     }
   },
   "additionalProperties": false,

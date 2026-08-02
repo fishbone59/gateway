@@ -13,12 +13,18 @@ import { Meteora } from '../meteora';
 import { MeteoraConfig } from '../meteora.config';
 import { MeteoraClmmZapInRequest } from '../schemas';
 import {
+  addJitoTip,
   addNozomiTips,
+  DEFAULT_FAST_CU_OVERRIDES,
+  deliverJitoBundle,
   deliverNozomiGated,
   deliverPipelined,
   DeliveryOutcome,
+  JITO_DEFAULT_MAX_TIP_LAMPORTS,
   prepareSequence,
+  resolveJitoTipLamports,
   STATIC_PRIORITY_FEE,
+  SWAP_CU_OVERRIDE,
 } from '../tx-delivery';
 
 const POOL_NOT_FOUND_MESSAGE = (poolAddress: string) => `Pool not found: ${poolAddress}`;
@@ -92,7 +98,7 @@ export async function zapIn(
   cleanupOnly: boolean = false,
   lowerPrice?: number,
   upperPrice?: number,
-  broadcastMode: 'serial' | 'fast' | 'temporal' = 'serial',
+  broadcastMode: 'serial' | 'fast' | 'temporal' | 'jito' = 'serial',
 ): Promise<ZapInResponseType> {
   const solana = await Solana.getInstance(network);
   const meteora = await Meteora.getInstance(network);
@@ -279,16 +285,17 @@ export async function zapIn(
       label: 'zapIn',
       tx: result.zapInTransaction,
       signers: [wallet, position],
-      cuOverride: 1_000_000,
+      cuOverride: 500_000, // measured 315k (±20-bin range) — over-pinning hurts Jito bundle packing
     });
   }
-  // cleanup also runs CPI-heavy paths (close ledger + unwrap); pin a higher limit as well
-  txSequence.push({ label: 'cleanup', tx: result.cleanUpTransaction, signers: [wallet], cuOverride: 400_000 });
+  // cleanup also runs CPI paths (close ledger + unwrap); measured only ~2k, keep slim for Jito packing
+  txSequence.push({ label: 'cleanup', tx: result.cleanUpTransaction, signers: [wallet], cuOverride: 50_000 });
 
   // 4. Deliver the sequence in the requested broadcast mode.
   // serial:   per-tx sendAndConfirmTransaction (slowest, step-precise errors)
   // fast:     shared blockhash + pipelined broadcast + batch confirm (~4s, order best-effort)
   // temporal: shared blockhash + Nozomi confirm-gated sequential delivery (~5-8s, deterministic)
+  // jito:     shared blockhash + single Jito bundle (one slot, strictly ordered, atomic)
   const recoveryHint = (_failed: string, confirmed: string[]): string =>
     confirmed.includes('ledger') && !confirmed.includes('zapIn')
       ? 'Ledger confirmed but position not opened — retry with resumeOnly=true.'
@@ -297,11 +304,14 @@ export async function zapIn(
         : 'Early step failed — wallet state unchanged apart from any confirmed setup ATAs.';
 
   let delivery: DeliveryOutcome;
+  let jitoTipLamports = MeteoraConfig.config.jitoTipLamports;
   if (broadcastMode === 'serial') {
     delivery = { signatures: [], results: [], totalFee: 0 };
     for (const { label, tx, signers, cuOverride } of txSequence) {
       tx.feePayer = wallet.publicKey;
-      logger.info(`Zap-in sending ${label} transaction (${(tx as Transaction).instructions?.length ?? '?'} instructions)...`);
+      logger.info(
+        `Zap-in sending ${label} transaction (${(tx as Transaction).instructions?.length ?? '?'} instructions)...`,
+      );
       const { signature, fee } = await solana.sendAndConfirmTransaction(tx, signers, undefined, cuOverride);
       logger.info(`Zap-in ${label} confirmed: ${signature}`);
       delivery.signatures.push(signature);
@@ -312,13 +322,32 @@ export async function zapIn(
       }
     }
   } else {
-    // Kick off blockhash (+ gas estimate for fast) BEFORE tip injection — the versioned-tx
-    // ALT fetches in addNozomiTips overlap with these RPCs. temporal uses a static priority
-    // fee: on Nozomi paths the tip is the lever, priority fee is ignored.
+    // Kick off blockhash (+ gas estimate for fast/jito) BEFORE tip injection — the
+    // versioned-tx ALT fetches in the tip helpers overlap with these RPCs. temporal
+    // uses a static priority fee: on Nozomi paths the tip is the lever, priority fee
+    // is ignored. jito follows the official guidance: priority fee AND bundle tip.
     const blockhashPromise = connection.getLatestBlockhashAndContext('confirmed');
-    const gasPromise = broadcastMode === 'fast' ? solana.estimateGasPrice() : Promise.resolve(STATIC_PRIORITY_FEE);
+    const gasPromise = broadcastMode === 'temporal' ? Promise.resolve(STATIC_PRIORITY_FEE) : solana.estimateGasPrice();
     if (broadcastMode === 'temporal') {
       await addNozomiTips(connection, wallet.publicKey, txSequence);
+    } else if (broadcastMode === 'jito') {
+      // jitoTipLamports=0 in config enables dynamic pricing: tip_floor p75 scaled
+      // by the bundle's total CU (auction competition is per unit of block space).
+      // Resolve CU exactly the way prepareSequence does (cuOverride ?? table ?? swap fallback).
+      const totalCu = txSequence.reduce(
+        (acc, s) =>
+          acc +
+          (s.cuOverride ??
+            DEFAULT_FAST_CU_OVERRIDES[s.label] ??
+            (s.label.startsWith('swap') ? SWAP_CU_OVERRIDE : 200_000)),
+        0,
+      );
+      jitoTipLamports = await resolveJitoTipLamports(
+        MeteoraConfig.config.jitoTipLamports,
+        totalCu,
+        MeteoraConfig.config.jitoTipMaxLamports ?? JITO_DEFAULT_MAX_TIP_LAMPORTS,
+      );
+      await addJitoTip(connection, wallet.publicKey, txSequence, jitoTipLamports);
     }
     const [
       {
@@ -327,18 +356,43 @@ export async function zapIn(
       priorityFee,
     ] = await Promise.all([blockhashPromise, gasPromise]);
     const prepared = prepareSequence(solana, wallet.publicKey, txSequence, blockhash, priorityFee);
-    delivery =
-      broadcastMode === 'temporal'
-        ? await deliverNozomiGated(solana, prepared, lastValidBlockHeight, MeteoraConfig.config.temporalApiKey, {
-            flowName: 'Zap-in',
-            keyLabel: 'zapIn',
-            recoveryHint,
-          })
-        : await deliverPipelined(solana, prepared, lastValidBlockHeight, {
-            flowName: 'Zap-in',
-            keyLabel: 'zapIn',
-            recoveryHint,
-          });
+    if (broadcastMode === 'temporal') {
+      delivery = await deliverNozomiGated(solana, prepared, lastValidBlockHeight, MeteoraConfig.config.temporalApiKey, {
+        flowName: 'Zap-in',
+        keyLabel: 'zapIn',
+        recoveryHint,
+      });
+    } else if (broadcastMode === 'jito') {
+      delivery = await deliverJitoBundle(
+        solana,
+        prepared,
+        lastValidBlockHeight,
+        MeteoraConfig.config.jitoUuid,
+        jitoTipLamports,
+        MeteoraConfig.config.jitoBlockEngine,
+        {
+          flowName: 'Zap-in',
+          keyLabel: 'zapIn',
+          recoveryHint,
+          attemptRecord: {
+            flow: 'zap-in',
+            positionAddress: position.publicKey.toBase58(),
+            poolAddress,
+            minBinId,
+            maxBinId,
+            amountIn,
+            inputTokenMint: inputMint.toBase58(),
+            walletAddress,
+          },
+        },
+      );
+    } else {
+      delivery = await deliverPipelined(solana, prepared, lastValidBlockHeight, {
+        flowName: 'Zap-in',
+        keyLabel: 'zapIn',
+        recoveryHint,
+      });
+    }
 
     // Post-execution semantic verification: a same-slot reorder (e.g. the ledger executing
     // before the swap) leaves every transaction "confirmed" yet deposits only one side of

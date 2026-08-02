@@ -13,3 +13,13 @@ strategyType: 0
 
 # Temporal (Nozomi) API key for broadcastMode=temporal zap-in (https://use.temporal.xyz)
 temporalApiKey: ''
+# Jito block engine for broadcastMode=jito zap-in (https://docs.jito.wtf)
+# UUID goes in the x-jito-auth header; default quota 2 req/s.
+jitoUuid: ''
+# Tip per bundle in lamports (min 1000). 0 = dynamic pricing: tip_floor p75 scaled
+# by bundle CU / 200k x 1.25, capped by jitoTipMaxLamports.
+jitoTipLamports: 0
+# Cap for dynamic tip pricing
+jitoTipMaxLamports: 200000
+# Regional block-engine endpoint (pick nearest: amsterdam/frankfurt/london/dublin/ny/slc/singapore/tokyo)
+jitoBlockEngine: https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles
