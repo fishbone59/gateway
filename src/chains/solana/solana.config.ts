@@ -5,6 +5,7 @@ import { getAvailableSolanaNetworks } from './solana.utils';
 export interface SolanaNetworkConfig {
   chainID: number;
   nodeURL: string;
+  wsURL?: string;
   nativeCurrencySymbol: string;
   geckoId: string;
   swapProvider?: string;
@@ -31,6 +32,7 @@ export function getSolanaNetworkConfig(network: string): SolanaNetworkConfig {
   return {
     chainID: ConfigManagerV2.getInstance().get(namespaceId + '.chainID'),
     nodeURL: ConfigManagerV2.getInstance().get(namespaceId + '.nodeURL'),
+    wsURL: ConfigManagerV2.getInstance().get(namespaceId + '.wsURL'),
     nativeCurrencySymbol: ConfigManagerV2.getInstance().get(namespaceId + '.nativeCurrencySymbol'),
     geckoId: ConfigManagerV2.getInstance().get(namespaceId + '.geckoId'),
     swapProvider: ConfigManagerV2.getInstance().get(namespaceId + '.swapProvider'),

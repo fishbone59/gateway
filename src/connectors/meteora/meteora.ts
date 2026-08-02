@@ -5,10 +5,12 @@ import { PublicKey, MemcmpFilter } from '@solana/web3.js';
 import { Solana } from '../../chains/solana/solana';
 import { MeteoraPoolInfo, PositionInfo, BinLiquidity } from '../../schemas/clmm-schema';
 import { convertDecimals } from '../../services/base';
+import { ConfigManagerV2 } from '../../services/config-manager-v2';
 import { httpErrors } from '../../services/error-handler';
 import { logger } from '../../services/logger';
 
 import { MeteoraConfig } from './meteora.config';
+import { PoolWatcher } from './pool-watcher';
 
 /** Pool data from Meteora API */
 export interface MeteoraApiPool {
@@ -63,6 +65,10 @@ export class Meteora {
   public config: MeteoraConfig.RootConfig;
   private dlmmPools: Map<string, DLMM> = new Map();
   private dlmmPoolPromises: Map<string, Promise<DLMM>> = new Map();
+  private poolWatcher: PoolWatcher | null = null;
+  private watcherUnavailable = false;
+  /** positionAddress -> poolAddress; avoids one getAccountInfo per position-info poll */
+  private readonly positionPoolMap: Map<string, string> = new Map();
 
   private constructor() {
     this.config = MeteoraConfig.config;
@@ -445,7 +451,44 @@ export class Meteora {
     };
   }
 
-  /** Gets position information directly by position address (without needing wallet) */
+  /** Lazily create the PoolWatcher from the network's wsURL (empty/absent = disabled). */
+  private ensureWatcher(): PoolWatcher | null {
+    if (this.poolWatcher || this.watcherUnavailable) {
+      return this.poolWatcher;
+    }
+    const wsURL = ConfigManagerV2.getInstance().get(`solana-${this.solana.network}.wsURL`);
+    if (!wsURL) {
+      this.watcherUnavailable = true;
+      return null;
+    }
+    this.poolWatcher = new PoolWatcher(wsURL, async (poolAddress) => {
+      const acc = await this.solana.connection.getAccountInfo(new PublicKey(poolAddress));
+      return acc?.data ?? null;
+    });
+    return this.poolWatcher;
+  }
+
+  /** Refresh a pool's lbPair state: prefer the WebSocket-fed watcher state
+   * (fresh = updated within 15s); fall back to an RPC refetchStates(). */
+  private async refreshPoolState(dlmmPool: DLMM, poolAddress: string): Promise<void> {
+    const watcher = this.ensureWatcher();
+    if (watcher) {
+      watcher.watch(poolAddress);
+      const state = watcher.getState(poolAddress);
+      if (state && Date.now() - state.updatedAt < 15_000) {
+        try {
+          const decoded = (dlmmPool as any).program.coder.accounts.decode('lbPair', state.data) as LbPair;
+          (dlmmPool as any).lbPair = decoded;
+          return;
+        } catch (e) {
+          logger.warn(`PoolWatcher decode failed for ${poolAddress}, refetching via RPC: ${(e as Error).message}`);
+        }
+      }
+    }
+    await dlmmPool.refetchStates();
+  }
+
+  /** Gets position info by address without needing wallet (uses position account to find pool) */
   async getPositionInfoByAddress(positionAddress: string): Promise<PositionInfo> {
     // Validate position address
     let positionPubkey: PublicKey;
@@ -455,43 +498,48 @@ export class Meteora {
       throw httpErrors.badRequest(`Invalid position address: ${positionAddress}`);
     }
 
-    // Fetch the position account to extract pool address
-    const positionAccount = await this.solana.connection.getAccountInfo(positionPubkey);
-
-    if (!positionAccount) {
-      // Check if the position ever existed by looking at transaction history
-      const signatures = await this.solana.connection.getSignaturesForAddress(positionPubkey, { limit: 1 });
-      if (signatures.length > 0) {
-        // Position had transactions, so it was created and later closed
-        throw httpErrors.notFound(`Position closed: ${positionAddress}`);
-      } else {
-        // No transactions found, position never existed
-        throw httpErrors.notFound(`Position not found: ${positionAddress}`);
+    // Resolve the pool address: cached mapping first (saves one getAccountInfo per
+    // executor poll tick), on-chain lookup only for positions we haven't seen.
+    let poolAddress = this.positionPoolMap.get(positionAddress);
+    if (!poolAddress) {
+      const positionAccount = await this.solana.connection.getAccountInfo(positionPubkey);
+      if (!positionAccount) {
+        // Check if the position ever existed by looking at transaction history
+        const signatures = await this.solana.connection.getSignaturesForAddress(positionPubkey, { limit: 1 });
+        if (signatures.length > 0) {
+          // Position had transactions, so it was created and later closed
+          throw httpErrors.notFound(`Position closed: ${positionAddress}`);
+        } else {
+          // No transactions found, position never existed
+          throw httpErrors.notFound(`Position not found: ${positionAddress}`);
+        }
       }
+      // Meteora position account structure: lbPair is at offset 8-40 (after discriminator)
+      poolAddress = new PublicKey(positionAccount.data.slice(8, 40)).toBase58();
+      this.positionPoolMap.set(positionAddress, poolAddress);
     }
-
-    // Parse the position account to extract the pool address (lbPair)
-    // Meteora position account structure: lbPair is at offset 8-40 (after discriminator)
-    const lbPairPubkey = new PublicKey(positionAccount.data.slice(8, 40));
-    const poolAddress = lbPairPubkey.toBase58();
 
     // Get the pool and position using SDK methods
     const dlmmPool = await this.getDlmmPool(poolAddress);
-    const position = await dlmmPool.getPosition(positionPubkey);
+    await this.refreshPoolState(dlmmPool, poolAddress);
+    const position = await dlmmPool.getPosition(positionPubkey).catch((e: Error) => {
+      // A closed position throws — evict the stale mapping so a later query re-resolves
+      this.positionPoolMap.delete(positionAddress);
+      throw e;
+    });
 
     if (!position) {
       throw httpErrors.notFound(`Position not found or closed: ${positionAddress}`);
     }
 
-    const activeBin = await dlmmPool.getActiveBin();
-
-    if (!activeBin || !activeBin.price || !activeBin.pricePerToken) {
-      throw httpErrors.badRequest(`Invalid active bin data for pool: ${poolAddress}`);
-    }
+    // Current price from the lbPair's active bin — pure math, no extra RPC (same
+    // formula the SDK's getActiveBin().pricePerToken uses, decimal-adjusted below)
+    const activeBinId = dlmmPool.lbPair.activeId;
 
     // Get prices from bin IDs
     const lowerPrice = getPriceOfBinByBinId(position.positionData.lowerBinId, dlmmPool.lbPair.binStep);
     const upperPrice = getPriceOfBinByBinId(position.positionData.upperBinId, dlmmPool.lbPair.binStep);
+    const currentPrice = getPriceOfBinByBinId(activeBinId, dlmmPool.lbPair.binStep);
 
     // Adjust for decimal difference (tokenX.mint.decimals - tokenY.mint.decimals)
     const decimalDiff = dlmmPool.tokenX.mint.decimals - dlmmPool.tokenY.mint.decimals;
@@ -523,7 +571,7 @@ export class Meteora {
       upperBinId: position.positionData.upperBinId,
       lowerPrice: adjustedLowerPrice,
       upperPrice: adjustedUpperPrice,
-      price: Number(activeBin.pricePerToken),
+      price: Number(currentPrice) * adjustmentFactor,
     };
   }
 

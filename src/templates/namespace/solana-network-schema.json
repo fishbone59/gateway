@@ -7,6 +7,10 @@
       "description": "Chain ID for this network (101 for mainnet-beta, 103 for devnet, 102 for testnet)"
     },
     "nodeURL": { "type": "string" },
+    "wsURL": {
+      "type": "string",
+      "description": "Optional WebSocket endpoint for account subscriptions (PoolWatcher); leave empty to disable"
+    },
     "nativeCurrencySymbol": { "type": "string" },
     "geckoId": {
       "type": "string",
