@@ -45,7 +45,11 @@ export async function executeQuote(
     priorityLevel,
   );
 
-  const { signature } = await solana.sendAndConfirmTransactionForWallet(transaction, walletAddress);
+  // Jupiter already embedded CU limit + priority fee (dynamicComputeUnitLimit) and
+  // simulated server-side — sign as-is and send (preserveEmbeddedBudget fast path).
+  const { signature } = await solana.sendAndConfirmTransactionForWallet(transaction, walletAddress, [], undefined, {
+    preserveEmbeddedBudget: true,
+  });
   const txData = await solana.connection.getTransaction(signature, {
     commitment: 'confirmed',
     maxSupportedTransactionVersion: 0,

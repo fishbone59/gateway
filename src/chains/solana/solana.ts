@@ -1331,7 +1331,30 @@ export class Solana {
     signers: Signer[] = [],
     priorityFeePerCU?: number,
     computeUnitsOverride?: number,
+    opts?: { preserveEmbeddedBudget?: boolean },
   ): Promise<{ signature: string; fee: number }> {
+    // Fast path: the builder (e.g. Jupiter /swap with dynamicComputeUnitLimit +
+    // priorityLevelWithMaxLamports) already embedded CU limit and priority fee AND
+    // simulated the tx server-side. Sign as-is and send — skips two local
+    // simulations and keeps the builder's priority fee (we'd otherwise overwrite
+    // it with our local estimate).
+    if (opts?.preserveEmbeddedBudget) {
+      if (tx instanceof VersionedTransaction) {
+        tx.sign([...signers]);
+      } else {
+        tx.sign(...signers);
+      }
+      const fastSerialized = tx.serialize();
+      const fast = await this._sendAndConfirmRawTransaction(fastSerialized, signers[0]?.publicKey?.toBase58());
+      if (fast.confirmed && fast.txData) {
+        const actualFee = this.getFee(fast.txData);
+        logger.info(`Transaction ${fast.signature} confirmed with total fee: ${actualFee.toFixed(6)} SOL`);
+        return { signature: fast.signature, fee: actualFee };
+      }
+      await this.throwIfLandedWithError(fast.signature);
+      throw this.confirmationTimeoutError(fast.signature);
+    }
+
     // Use provided priority fee or estimate it
     const currentPriorityFee = priorityFeePerCU ?? (await this.estimateGasPrice());
 
@@ -1548,6 +1571,7 @@ export class Solana {
     address: string,
     extraSigners: Keypair[] = [],
     priorityFeePerCU?: number,
+    opts?: { preserveEmbeddedBudget?: boolean },
   ): Promise<{ signature: string; fee: number }> {
     // Extra signers are for EPHEMERAL keypairs (position NFT mints, new accounts); the
     // wallet's own signature is this method's job, per wallet type. Some SDK builders
@@ -1567,14 +1591,23 @@ export class Solana {
 
     // Pre-flight simulate here (once, for every connector) so callers get a clear error
     // instead of a failed on-chain send; this is why connectors no longer simulate
-    // themselves.
-    await this.simulateWithErrorHandling(tx);
+    // themselves. Skipped when the builder already simulated server-side
+    // (preserveEmbeddedBudget, e.g. Jupiter /swap).
+    if (!opts?.preserveEmbeddedBudget) {
+      await this.simulateWithErrorHandling(tx);
+    }
 
     const { wallet, walletType } = await this.prepareWallet(address);
 
     // Local wallets sign in-process: reuse the standard path (keypair + extras).
     if (walletType === 'local') {
-      return this.sendAndConfirmTransaction(tx, [wallet as Keypair, ...extraSigners], priorityFeePerCU);
+      return this.sendAndConfirmTransaction(
+        tx,
+        [wallet as Keypair, ...extraSigners],
+        priorityFeePerCU,
+        undefined,
+        opts,
+      );
     }
 
     // External wallets (hardware/Ledger): add the compute budget and sign any extra
@@ -2102,7 +2135,9 @@ export class Solana {
     serializedTx: Buffer | Uint8Array,
     watchAddress?: string,
   ): Promise<{ confirmed: boolean; signature: string; txData: any }> {
-    const { lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
+    // Kick off blockhash fetch in parallel with the send — it's only needed for
+    // the polling/expiry path, not for broadcasting.
+    const blockhashPromise = this.connection.getLatestBlockhash('confirmed');
 
     let signature: string | null = null;
 
@@ -2116,9 +2151,11 @@ export class Solana {
       // Try WebSocket first, fall back to polling
       const wsResult = await this._confirmViaWebSocket(signature);
       if (wsResult !== null) {
+        void blockhashPromise.catch(() => undefined);
         return { ...wsResult, signature };
       }
 
+      const { lastValidBlockHeight } = await blockhashPromise;
       const pollingResult = watchAddress
         ? await this._racePollingWithWalletWss(signature, lastValidBlockHeight, watchAddress)
         : await this._confirmViaPolling(signature, lastValidBlockHeight);
