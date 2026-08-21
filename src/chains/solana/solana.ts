@@ -27,6 +27,7 @@ import {
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import fse from 'fs-extra';
+import { RawData, WebSocket } from 'ws';
 
 // TODO: Replace with Fastify httpErrors
 const SIMULATION_ERROR_MESSAGE = 'Transaction simulation failed: ';
@@ -1388,7 +1389,10 @@ export class Solana {
 
     // Use the confirmation retry logic from sendAndConfirmRawTransaction
     const serializedTx = tx.serialize();
-    const { confirmed, signature, txData } = await this._sendAndConfirmRawTransaction(serializedTx);
+    const { confirmed, signature, txData } = await this._sendAndConfirmRawTransaction(
+      serializedTx,
+      signers[0]?.publicKey?.toBase58(),
+    );
 
     if (confirmed && txData) {
       const actualFee = this.getFee(txData);
@@ -1622,7 +1626,7 @@ export class Solana {
       }
     }
 
-    const { confirmed, signature, txData } = await this._sendAndConfirmRawTransaction(signedTx.serialize());
+    const { confirmed, signature, txData } = await this._sendAndConfirmRawTransaction(signedTx.serialize(), address);
     if (confirmed && txData) {
       const actualFee = this.getFee(txData);
       logger.info(`Transaction ${signature} confirmed with total fee: ${actualFee.toFixed(6)} SOL`);
@@ -1904,11 +1908,115 @@ export class Solana {
   }
 
   /**
+   * Confirm via Shyft WSS accountSubscribe on the fee-payer wallet: any landed tx
+   * touching the wallet changes its lamport balance and fires a notification, at
+   * which point we check our signature's status. Much faster than the 2s polling
+   * loop. Returns null on timeout/error so the caller can keep polling.
+   */
+  private async _confirmViaWalletWss(
+    signature: string,
+    watchAddress: string,
+    timeoutMs: number = 65_000,
+  ): Promise<{ confirmed: boolean; txData: any } | null> {
+    const wsUrl = (this.config as any).wsURL;
+    if (!wsUrl || !watchAddress) return null;
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let ws: WebSocket | null = null;
+      const finish = (r: { confirmed: boolean; txData: any } | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          ws?.close();
+        } catch {
+          /* ignore */
+        }
+        resolve(r);
+      };
+      const timer = setTimeout(() => finish(null), timeoutMs);
+
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch {
+        finish(null);
+        return;
+      }
+
+      ws.on('open', () => {
+        try {
+          ws!.send(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'accountSubscribe',
+              // commitment MUST be explicit: the default 'finalized' trails ~10-15s
+              params: [watchAddress, { encoding: 'base64', commitment: 'confirmed' }],
+            }),
+          );
+        } catch {
+          finish(null);
+        }
+      });
+
+      ws.on('message', (raw: RawData) => {
+        void (async () => {
+          try {
+            const msg = JSON.parse(raw.toString());
+            if (msg?.method !== 'accountNotification') return;
+            // Wallet balance changed — did OUR transaction land?
+            const statuses = await this.connection.getSignatureStatuses([signature]);
+            const status = statuses?.value?.[0];
+            if (!status) return; // unrelated wallet activity; keep waiting
+            if (status.err) {
+              const { parseSolanaError } = await import('./solana-error-parser');
+              const parsed = parseSolanaError(JSON.stringify(status.err));
+              logger.error(`❌ Transaction ${signature} failed (wallet WSS): ${parsed.type} - ${parsed.message}`);
+              finish({ confirmed: false, txData: null });
+              return;
+            }
+            if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+              logger.info(`✅ Transaction ${signature} confirmed via wallet WSS`);
+              const txData = await this._fetchTransactionWithRetry(signature);
+              finish({ confirmed: true, txData });
+            }
+          } catch {
+            /* transient — keep waiting */
+          }
+        })();
+      });
+
+      ws.on('error', () => finish(null));
+      ws.on('close', () => finish(null));
+    });
+  }
+
+  /** Race wallet-WSS confirmation against the polling loop; first conclusive wins. */
+  private async _racePollingWithWalletWss(
+    signature: string,
+    lastValidBlockHeight: number,
+    watchAddress: string,
+  ): Promise<{ confirmed: boolean; txData: any }> {
+    let aborted = false;
+    const polling = this._confirmViaPolling(signature, lastValidBlockHeight, () => aborted);
+    const wss = this._confirmViaWalletWss(signature, watchAddress).then((r) => {
+      if (r !== null) {
+        aborted = true;
+        return r;
+      }
+      return polling; // WSS inconclusive — keep waiting on polling
+    });
+    return Promise.race([polling, wss]);
+  }
+
+  /**
    * Confirm transaction via REST polling
    */
   private async _confirmViaPolling(
     signature: string,
     lastValidBlockHeight: number,
+    shouldAbort?: () => boolean,
   ): Promise<{ confirmed: boolean; txData: any }> {
     logger.info(`🚀 Sent transaction ${signature}, polling for confirmation...`);
 
@@ -1923,6 +2031,9 @@ export class Solana {
 
     while (attempts < MAX_POLL_ATTEMPTS) {
       attempts++;
+
+      // Aborted because a parallel confirmation path (wallet WSS) already resolved
+      if (shouldAbort?.()) return { confirmed: false, txData: null };
 
       try {
         const statuses = await this.connection.getSignatureStatuses([signature]);
@@ -1989,6 +2100,7 @@ export class Solana {
    */
   private async _sendAndConfirmRawTransaction(
     serializedTx: Buffer | Uint8Array,
+    watchAddress?: string,
   ): Promise<{ confirmed: boolean; signature: string; txData: any }> {
     const { lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
 
@@ -2007,7 +2119,9 @@ export class Solana {
         return { ...wsResult, signature };
       }
 
-      const pollingResult = await this._confirmViaPolling(signature, lastValidBlockHeight);
+      const pollingResult = watchAddress
+        ? await this._racePollingWithWalletWss(signature, lastValidBlockHeight, watchAddress)
+        : await this._confirmViaPolling(signature, lastValidBlockHeight);
       return { ...pollingResult, signature };
     } catch (sendError: any) {
       if (sendError.statusCode === 429) {
