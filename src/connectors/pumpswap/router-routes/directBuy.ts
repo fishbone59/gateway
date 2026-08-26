@@ -25,13 +25,19 @@
 // - fee_config = PDA(["fee_config", pAMM_program_id], fee_program)
 // - user_volume_accumulator = PDA(["user_volume_accumulator", user])，不存在则须先
 //   init_user_volume_accumulator（discriminator [94,6,202,115,255,96,232,183]）
-// - 不支持：quote != wSOL 的池、is_mayhem_mode / is_cashback_coin 池、base 为 Token-2022 的池
-//   （4xx 让引擎回退 Jupiter）
+// - 不支持：quote != wSOL 的池、is_mayhem_mode 池（需 reserved 收款方列表）（4xx 让引擎回退 Jupiter）
+//   cashback 币 / Token-2022 base 均支持（remaining 结构相同，官方 SDK 证实）
 // - cc=SET 池（coin_creator@211 ≠ 11111111…，2026-08-26 实单踩坑）：必须多传一个 remaining
 //   account = PDA(["pool-v2", base_mint], pAMM)（按 mint 派生、只读、链上不存在也要传，
-//   否则 6062 InvalidPoolV2），位置在 buyback 收款方之前；且 creator fee 走 fee_config 阶梯表
-//   （最高 95bps，实际由 GetFees CPI 按池子规模算）——本地定价用 120bps 上限保守估计
-//   （minOut 略保守无害，entry/qty 反正以链上 balance diff 为准）
+//   否则 6062 InvalidPoolV2），位置在 cashback ATA 之后、buyback 收款方之前
+// - cashback 币：remaining[0] 附 ATA(quote_mint, user_volume_accumulator) 可写（可选，
+//   附了 creator fee 返现给我们，不附则归 creator —— 官方 PUMP_CASHBACK_README）
+// - 费率精确计算（官方 pump-swap-sdk fees.js 同款）：canonical 池（pool.creator@11 ==
+//   PDA(["pool-authority", base_mint], pump 程序 6EF8rr…），即 migrate 毕业池）→ 本地
+//   FEE_TIERS 阶梯表按 mcap=quoteReserve×mintSupply/baseReserve 查档；非 canonical →
+//   FLAT_FEES(25,5,0)。阶梯表为 fee_config 链上快照（2026-08-26，mindshare 实单 GetFees
+//   返回 (20,5,95) 交叉验证）。报价用 effective quote reserve = vault + virtual_quote_reserves@245
+//   （i128，现全链为 0）
 import { Type } from '@sinclair/typebox';
 import {
   getAssociatedTokenAddressSync,
@@ -66,6 +72,55 @@ const INIT_UVA_DISC = Buffer.from([94, 6, 202, 115, 255, 96, 232, 183]);
 // 打满 150k CU 时优先费 ~0.000015 SOL —— 对齐 Jupiter veryHigh 档实测（1.3-1.6e-5 SOL）
 const DEFAULT_CU_LIMIT = 150_000;
 const DEFAULT_CU_PRICE_MICRO_LAMPORTS = 100_000;
+
+const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+
+// ---- 费率表（2026-08-26 链上 fee_config 5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx 快照，
+// 官方 pump_fees IDL 布局。算法 = 官方 pump-swap-sdk fees.js computeFeesBps：
+// canonical 池（pool.creator@11 == PDA(["pool-authority", base_mint], PUMP_PROGRAM)，即
+// bonding curve migrate 毕业的池）→ 按 mcap(lamports)=quoteReserve×mintSupply/baseReserve
+// 查 FEE_TIERS；非 canonical（社区池等）→ FLAT_FEES。阈值单位 lamports。
+// 快照已用 mindshare 实单 GetFees CPI 返回值 (20,5,95) 交叉验证（mcap≈1180 SOL → tier1）。
+// 若 pump 官方改档：重读 fee_config 账户更新本表即可。）
+const FLAT_FEES = { lp: 25, proto: 5, creator: 0 } as const;
+const FEE_TIERS: ReadonlyArray<{ th: bigint; lp: number; proto: number; creator: number }> = [
+  { th: 0n, lp: 2, proto: 93, creator: 30 },
+  { th: 420000000000n, lp: 20, proto: 5, creator: 95 },
+  { th: 1470000000000n, lp: 20, proto: 5, creator: 90 },
+  { th: 2460000000000n, lp: 20, proto: 5, creator: 85 },
+  { th: 3440000000000n, lp: 20, proto: 5, creator: 80 },
+  { th: 4420000000000n, lp: 20, proto: 5, creator: 75 },
+  { th: 9820000000000n, lp: 20, proto: 5, creator: 70 },
+  { th: 14740000000000n, lp: 20, proto: 5, creator: 65 },
+  { th: 19650000000000n, lp: 20, proto: 5, creator: 60 },
+  { th: 24560000000000n, lp: 20, proto: 5, creator: 55 },
+  { th: 29470000000000n, lp: 20, proto: 5, creator: 50 },
+  { th: 34380000000000n, lp: 20, proto: 5, creator: 45 },
+  { th: 39300000000000n, lp: 20, proto: 5, creator: 40 },
+  { th: 44210000000000n, lp: 20, proto: 5, creator: 35 },
+  { th: 49120000000000n, lp: 20, proto: 5, creator: 30 },
+  { th: 54030000000000n, lp: 20, proto: 5, creator: 28 },
+  { th: 58940000000000n, lp: 20, proto: 5, creator: 25 },
+  { th: 63860000000000n, lp: 20, proto: 5, creator: 23 },
+  { th: 68770000000000n, lp: 20, proto: 5, creator: 20 },
+  { th: 73681000000000n, lp: 20, proto: 5, creator: 18 },
+  { th: 78590000000000n, lp: 20, proto: 5, creator: 15 },
+  { th: 83500000000000n, lp: 20, proto: 5, creator: 13 },
+  { th: 88400000000000n, lp: 20, proto: 5, creator: 10 },
+  { th: 93330000000000n, lp: 20, proto: 5, creator: 8 },
+  { th: 98240000000000n, lp: 20, proto: 5, creator: 5 },
+];
+/** calculateFeeTier：mcap 落入最后一个 threshold ≤ mcap 的档 */
+function tierFees(mcapLamports: bigint): { lp: number; proto: number; creator: number } {
+  for (let i = FEE_TIERS.length - 1; i >= 0; i--) if (mcapLamports >= FEE_TIERS[i].th) return FEE_TIERS[i];
+  return FEE_TIERS[0];
+}
+/** i128 LE 读取（Pool.virtual_quote_reserves @245，现全链为 0，官方要求报价用 effective=raw+virtual） */
+function readI128le(b: Buffer): bigint {
+  let v = 0n;
+  for (let i = 15; i >= 0; i--) v = v * 256n + BigInt(b[i]);
+  return v >= 1n << 127n ? v - (1n << 128n) : v;
+}
 
 const u64le = (n: bigint): Buffer => {
   const b = Buffer.alloc(8);
@@ -105,6 +160,9 @@ export interface DirectBuyResult {
   expectedOut: string;
   minOut: string;
   feeBps: number;
+  canonical: boolean;
+  feeBreakdown: { lp: number; proto: number; creator: number };
+  cashback: boolean;
   timings: Record<string, number>;
 }
 
@@ -141,7 +199,8 @@ export async function directBuy(
   const poolQuoteTa = new PublicKey(pd.subarray(171, 203));
   if (poolBaseMint.toBase58() !== baseMint) throw httpErrors.badRequest('pool base_mint != requested baseMint');
   if (!quoteMint.equals(WSOL_MINT)) throw httpErrors.badRequest('pool quote is not wSOL (unsupported)');
-  if (pd[243] || pd[244]) throw httpErrors.badRequest('mayhem/cashback pool (unsupported)');
+  if (pd[243]) throw httpErrors.badRequest('mayhem pool (unsupported, reserved fee recipients)');
+  const isCashback = !!pd[244]; // cashback 币可直连：附 cashback ATA 还能拿 creator fee 返现
 
   // ---- 2. 池状态（储备量=池的两个 token 账户余额）+ 全局配置 + base mint owner + blockhash 并行
   const s0 = Date.now();
@@ -159,21 +218,29 @@ export async function directBuy(
   const reserveQuote = quoteTaInfo.data.readBigUInt64LE(64);
   if (reserveBase === 0n || reserveQuote === 0n) throw httpErrors.badRequest('empty pool reserves');
   const g = gcInfo.data;
-  const lpFeeBps = Number(g.readBigUInt64LE(40));
-  const protocolFeeBps = Number(g.readBigUInt64LE(48));
   const baseTokenProgram = baseMintInfo.owner.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
-  if (baseTokenProgram.equals(TOKEN_2022_PROGRAM_ID))
-    throw httpErrors.badRequest('Token-2022 base mint (unsupported v1, fallback to Jupiter)');
-  // cc=SET 池（coin_creator ≠ 11111111…）：阶梯 creator fee（上限 95bps）+ 必须传 pool-v2 PDA
+  // 费率精确计算（官方 pump-swap-sdk fees.js 同款；2026-08-26 起替代 120bps 保守上限）：
+  // canonical 池（pool.creator@11 == PDA(["pool-authority", base_mint], pump 程序）→ 阶梯表按
+  // mcap 查档；非 canonical → flat (25,5,0)。mcap = effectiveQuoteReserve × mintSupply / baseReserve。
+  const poolCreator = new PublicKey(pd.subarray(11, 43));
+  const canonical = poolCreator.equals(
+    PublicKey.findProgramAddressSync([Buffer.from('pool-authority'), poolBaseMint.toBuffer()], PUMP_PROGRAM)[0],
+  );
+  const mintSupply = baseMintInfo.data.readBigUInt64LE(36); // SPL/t22 mint 布局 supply @36
+  const virtualQuote = pd.length >= 261 ? readI128le(pd.subarray(245, 261)) : 0n; // 现全链为 0
+  const effectiveQuoteReserve = reserveQuote + virtualQuote;
+  if (effectiveQuoteReserve <= 0n) throw httpErrors.badRequest('empty effective quote reserves');
+  const mcapLamports = (effectiveQuoteReserve * mintSupply) / reserveBase;
+  const fees = canonical ? tierFees(mcapLamports) : FLAT_FEES;
+  const feeBps = fees.lp + fees.proto + fees.creator;
+  // pool-v2 remaining account 的条件（官方 SDK buy.js）：coin_creator ≠ default
   const hasCreator = !coinCreator.equals(SystemProgram.programId);
-  const creatorFeeBps = hasCreator ? 95 : Number(g.readBigUInt64LE(313)); // 95 = fee_config 阶梯表上限（保守）
-  const feeBps = lpFeeBps + protocolFeeBps + creatorFeeBps;
   const protocolFeeRecipient = new PublicKey(g.subarray(57, 89)); // recipients[0]
   const buybackBps = Number(g.readBigUInt64LE(899));
 
   // ---- 3. 本地定价（恒定乘积，全 floor 取整 —— minOut 偏保守方向）
   const effectiveIn = (amountLamports * BigInt(10_000 - feeBps)) / 10_000n;
-  const expectedOut = (effectiveIn * reserveBase) / (reserveQuote + effectiveIn);
+  const expectedOut = (effectiveIn * reserveBase) / (effectiveQuoteReserve + effectiveIn);
   const slippageBps = BigInt(Math.round(slippagePct * 100));
   const minOut = (expectedOut * (10_000n - slippageBps)) / 10_000n;
   if (minOut <= 0n) throw httpErrors.badRequest('minOut rounds to zero (amount too small)');
@@ -236,9 +303,18 @@ export async function directBuy(
     },
     { pubkey: FEE_PROGRAM, isWritable: false, isSigner: false },
   ];
+  // remaining accounts 顺序（官方 SDK buyInstructionsNoPool 原文）：
+  // [cashback 币: ATA(quote_mint, user_volume_accumulator) 可写]
+  // → [coin_creator≠0: pool-v2 PDA 只读] → [buyback_recipient 只读, 其 quote ATA 可写]
+  if (isCashback) {
+    keys.push({
+      pubkey: getAssociatedTokenAddressSync(quoteMint, userVolAcc, true),
+      isWritable: true,
+      isSigner: false,
+    });
+  }
   if (hasCreator) {
-    // cc=SET 池：pool-v2 PDA（按 base_mint 派生，只读，链上不存在也传）必须是第一个
-    // remaining account，否则 6062 InvalidPoolV2（2026-08-26 mindshare 实单踩坑）
+    // cc=SET 池：pool-v2 PDA（按 base_mint 派生，只读，链上不存在也传）否则 6062 InvalidPoolV2
     keys.push({
       pubkey: pda([Buffer.from('pool-v2'), poolBaseMint.toBuffer()]),
       isWritable: false,
@@ -246,9 +322,9 @@ export async function directBuy(
     });
   }
   if (buybackBps > 0) {
-    // 程序强制（6058）：remaining accounts = [buyback_recipient, 其 quote ATA]，任选数组其一
+    // 程序强制（6058）：任选 8 个 buyback_fee_recipients 其一
     const bbRecipient = new PublicKey(g.subarray(643, 675)); // buyback_fee_recipients[0]
-    keys.push({ pubkey: bbRecipient, isWritable: true, isSigner: false });
+    keys.push({ pubkey: bbRecipient, isWritable: false, isSigner: false });
     keys.push({
       pubkey: getAssociatedTokenAddressSync(quoteMint, bbRecipient, true),
       isWritable: true,
@@ -290,6 +366,9 @@ export async function directBuy(
     expectedOut: expectedOut.toString(),
     minOut: minOut.toString(),
     feeBps,
+    canonical,
+    feeBreakdown: { lp: fees.lp, proto: fees.proto, creator: fees.creator },
+    cashback: isCashback,
     timings,
   };
 }
