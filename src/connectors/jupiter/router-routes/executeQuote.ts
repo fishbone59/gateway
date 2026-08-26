@@ -14,6 +14,7 @@ export async function executeQuote(
   quoteId: string,
   priorityLevel?: string,
   maxLamports?: number,
+  waitConfirm = true,
 ): Promise<SwapExecuteResponseType> {
   // Retrieve cached quote
   const quote = quoteCache.get(quoteId);
@@ -44,6 +45,22 @@ export async function executeQuote(
     maxLamports,
     priorityLevel,
   );
+
+  if (!waitConfirm) {
+    // Fast path (copy-engine): Jupiter already embedded CU limit + priority fee
+    // (dynamicComputeUnitLimit) and simulated server-side. Sign as-is and send;
+    // return the signature immediately — the caller confirms via its own WSS
+    // and computes balance diffs itself. Skips gateway-side confirm wait +
+    // getTransaction + handleConfirmation (~0.5-1s saved).
+    const keypair = await solana.getWallet(walletAddress);
+    transaction.sign([keypair]);
+    const signature = await solana.connection.sendRawTransaction(transaction.serialize(), {
+      skipPreflight: true,
+      maxRetries: 0,
+    });
+    logger.info(`Swap sent (waitConfirm=false): ${signature} for ${inputToken.symbol} -> ${outputToken.symbol}`);
+    return { signature, status: 0 } as SwapExecuteResponseType;
+  }
 
   // Jupiter already embedded CU limit + priority fee (dynamicComputeUnitLimit) and
   // simulated server-side — sign as-is and send (preserveEmbeddedBudget fast path).
@@ -92,10 +109,10 @@ export const executeQuoteRoute: FastifyPluginAsync = async (fastify) => {
     },
     async (request) => {
       try {
-        const { walletAddress, network, quoteId, priorityLevel, maxLamports } =
+        const { walletAddress, network, quoteId, priorityLevel, maxLamports, waitConfirm } =
           request.body as typeof JupiterExecuteQuoteRequest._type;
 
-        return await executeQuote(walletAddress, network, quoteId, priorityLevel, maxLamports);
+        return await executeQuote(walletAddress, network, quoteId, priorityLevel, maxLamports, waitConfirm);
       } catch (e) {
         if (e.statusCode) throw e;
         logger.error('Error executing quote:', e);

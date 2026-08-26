@@ -180,6 +180,14 @@ export const JupiterExecuteQuoteRequest = Type.Object({
       default: [JupiterConfig.config.maxLamports],
     }),
   ),
+  waitConfirm: Type.Optional(
+    Type.Boolean({
+      description:
+        'Wait for on-chain confirmation + balance diff before returning. ' +
+        'false = return signature immediately after send (caller confirms via own WSS/RPC).',
+      default: true,
+    }),
+  ),
 });
 
 // Jupiter-specific execute-swap request (superset of base ExecuteSwapRequest)

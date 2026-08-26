@@ -24,6 +24,7 @@ import { okxRoutes } from './connectors/okx/okx.routes';
 import { orcaRoutes } from './connectors/orca/orca.routes';
 import { pancakeswapRoutes } from './connectors/pancakeswap/pancakeswap.routes';
 import { pancakeswapSolRoutes } from './connectors/pancakeswap-sol/pancakeswap-sol.routes';
+import { pumpswapRoutes } from './connectors/pumpswap/pumpswap.routes';
 import { raydiumRoutes } from './connectors/raydium/raydium.routes';
 import { titanRoutes } from './connectors/titan/titan.routes';
 import { uniswapRoutes } from './connectors/uniswap/uniswap.routes';
@@ -308,6 +309,11 @@ const configureGatewayServer = () => {
     });
     app.register(jupiterRoutes.trigger, {
       prefix: '/connectors/jupiter/trigger',
+    });
+
+    // PumpSwap AMM direct-buy routes (local patch)
+    app.register(pumpswapRoutes.router, {
+      prefix: '/connectors/pumpswap/router',
     });
 
     // DFlow routes
