@@ -68,9 +68,9 @@ const POOL_DISCRIMINATOR = Buffer.from([241, 154, 109, 4, 17, 177, 109, 188]);
 const BUY_EXACT_QUOTE_IN_DISC = Buffer.from([198, 46, 21, 82, 180, 217, 232, 112]);
 const INIT_UVA_DISC = Buffer.from([94, 6, 202, 115, 255, 96, 232, 183]);
 
-// 自建交易 CU 预算（simulate 实测 swap 整包 ~100k CU）；价格默认 0.1 lamport/CU，
-// 打满 150k CU 时优先费 ~0.000015 SOL —— 对齐 Jupiter veryHigh 档实测（1.3-1.6e-5 SOL）
-const DEFAULT_CU_LIMIT = 150_000;
+// 自建交易 CU 预算（T22 首买含 ATA 创建时实测会超过 150k）；价格默认 0.1 lamport/CU，
+// 请求 250k CU 时优先费 ~0.000025 SOL（Solana 优先费按请求上限计费，比 150k 每笔多 ~0.00001 SOL）。
+const DEFAULT_CU_LIMIT = 250_000;
 const DEFAULT_CU_PRICE_MICRO_LAMPORTS = 100_000;
 
 const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
