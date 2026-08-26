@@ -321,10 +321,23 @@ export class Solana {
     }
   }
 
+  /**
+   * 解密后 Keypair 进程内缓存（本地补丁，2026-08-26）：getWallet 的 scrypt(N=2^17, ~128MB)
+   * 解密实测 ~500-800ms，是每笔交易签名前的最大单笔开销。passphrase 本已随 --passphrase
+   * 常驻进程内存，缓存 Keypair 的风险增量有限。删除钱包时经 invalidateWalletCache 失效。
+   */
+  private static walletKeypairCache = new Map<string, Keypair>();
+  public static invalidateWalletCache(address: string): void {
+    Solana.walletKeypairCache.delete(address);
+  }
+
   async getWallet(address: string): Promise<Keypair> {
     try {
       // Validate the address format first
       const validatedAddress = Solana.validateAddress(address);
+
+      const cached = Solana.walletKeypairCache.get(validatedAddress);
+      if (cached) return cached;
 
       // Use the safe wallet file path utility to prevent path injection
       const safeWalletPath = getSafeWalletFilePath('solana', validatedAddress);
@@ -351,7 +364,9 @@ export class Solana {
         }
       }
 
-      return Keypair.fromSecretKey(new Uint8Array(bs58.decode(decrypted)));
+      const keypair = Keypair.fromSecretKey(new Uint8Array(bs58.decode(decrypted)));
+      Solana.walletKeypairCache.set(validatedAddress, keypair);
+      return keypair;
     } catch (error) {
       if (error.message.includes('Invalid Solana address')) {
         throw error; // Re-throw validation errors
