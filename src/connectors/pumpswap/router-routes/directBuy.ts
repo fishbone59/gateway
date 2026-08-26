@@ -25,7 +25,13 @@
 // - fee_config = PDA(["fee_config", pAMM_program_id], fee_program)
 // - user_volume_accumulator = PDA(["user_volume_accumulator", user])，不存在则须先
 //   init_user_volume_accumulator（discriminator [94,6,202,115,255,96,232,183]）
-// - 不支持：quote != wSOL 的池、is_mayhem_mode / is_cashback_coin 池（4xx 让引擎回退 Jupiter）
+// - 不支持：quote != wSOL 的池、is_mayhem_mode / is_cashback_coin 池、base 为 Token-2022 的池
+//   （4xx 让引擎回退 Jupiter）
+// - cc=SET 池（coin_creator@211 ≠ 11111111…，2026-08-26 实单踩坑）：必须多传一个 remaining
+//   account = PDA(["pool-v2", base_mint], pAMM)（按 mint 派生、只读、链上不存在也要传，
+//   否则 6062 InvalidPoolV2），位置在 buyback 收款方之前；且 creator fee 走 fee_config 阶梯表
+//   （最高 95bps，实际由 GetFees CPI 按池子规模算）——本地定价用 120bps 上限保守估计
+//   （minOut 略保守无害，entry/qty 反正以链上 balance diff 为准）
 import { Type } from '@sinclair/typebox';
 import {
   getAssociatedTokenAddressSync,
@@ -155,10 +161,14 @@ export async function directBuy(
   const g = gcInfo.data;
   const lpFeeBps = Number(g.readBigUInt64LE(40));
   const protocolFeeBps = Number(g.readBigUInt64LE(48));
-  const creatorFeeBps = Number(g.readBigUInt64LE(313));
+  const baseTokenProgram = baseMintInfo.owner.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
+  if (baseTokenProgram.equals(TOKEN_2022_PROGRAM_ID))
+    throw httpErrors.badRequest('Token-2022 base mint (unsupported v1, fallback to Jupiter)');
+  // cc=SET 池（coin_creator ≠ 11111111…）：阶梯 creator fee（上限 95bps）+ 必须传 pool-v2 PDA
+  const hasCreator = !coinCreator.equals(SystemProgram.programId);
+  const creatorFeeBps = hasCreator ? 95 : Number(g.readBigUInt64LE(313)); // 95 = fee_config 阶梯表上限（保守）
   const feeBps = lpFeeBps + protocolFeeBps + creatorFeeBps;
   const protocolFeeRecipient = new PublicKey(g.subarray(57, 89)); // recipients[0]
-  const baseTokenProgram = baseMintInfo.owner.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
   const buybackBps = Number(g.readBigUInt64LE(899));
 
   // ---- 3. 本地定价（恒定乘积，全 floor 取整 —— minOut 偏保守方向）
@@ -226,6 +236,15 @@ export async function directBuy(
     },
     { pubkey: FEE_PROGRAM, isWritable: false, isSigner: false },
   ];
+  if (hasCreator) {
+    // cc=SET 池：pool-v2 PDA（按 base_mint 派生，只读，链上不存在也传）必须是第一个
+    // remaining account，否则 6062 InvalidPoolV2（2026-08-26 mindshare 实单踩坑）
+    keys.push({
+      pubkey: pda([Buffer.from('pool-v2'), poolBaseMint.toBuffer()]),
+      isWritable: false,
+      isSigner: false,
+    });
+  }
   if (buybackBps > 0) {
     // 程序强制（6058）：remaining accounts = [buyback_recipient, 其 quote ATA]，任选数组其一
     const bbRecipient = new PublicKey(g.subarray(643, 675)); // buyback_fee_recipients[0]
