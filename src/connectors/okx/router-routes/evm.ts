@@ -1,7 +1,7 @@
 // OKX connector EVM execution path (local patch, 2026-08-29): quote + execute on EVM
 // networks (robinhoodchain). OKX /swap returns unsigned tx fields; gateway signs with the
-// local EVM wallet and broadcasts via the network nodeURL. approve is handled serially
-// per-amount (allowance precheck -> approve exact amount -> swap), never max-approve.
+// local EVM wallet and broadcasts via the network nodeURL. approve: allowance precheck ->
+// top up with exact-amount approve -> swap（WETH 已于 2026-08-29 链上授 maxUint256，买入恒跳过）。
 import { Static } from '@sinclair/typebox';
 import { BigNumber, utils } from 'ethers';
 import { v4 as uuidv4 } from 'uuid';
@@ -38,6 +38,13 @@ async function waitReceipt(
   return { status: 0, receipt: null };
 }
 
+/** Number → 十进制字符串（parseUnits 拒科学计数法：1e-7 会炸；展开为小数形式） */
+function toDecimalString(n: number): string {
+  const s = n.toString();
+  if (!/[eE]/.test(s)) return s;
+  return n.toLocaleString('fullwide', { useGrouping: false, maximumFractionDigits: 30 });
+}
+
 export async function quoteSwapEvm(
   network: string,
   baseToken: string,
@@ -58,7 +65,7 @@ export async function quoteSwapEvm(
   const inputToken = side === 'SELL' ? baseTokenInfo : quoteTokenInfo;
   const outputToken = side === 'SELL' ? quoteTokenInfo : baseTokenInfo;
   const swapMode: 'exactIn' | 'exactOut' = side === 'BUY' ? 'exactOut' : 'exactIn';
-  const baseAmountRaw = utils.parseUnits(amount.toString(), baseTokenInfo.decimals).toString();
+  const baseAmountRaw = utils.parseUnits(toDecimalString(amount), baseTokenInfo.decimals).toString();
 
   logger.info(`Getting OKX EVM quote for ${amount} ${inputToken.symbol} -> ${outputToken.symbol} (${side})`);
 
