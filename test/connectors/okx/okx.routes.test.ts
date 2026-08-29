@@ -33,7 +33,7 @@ describe('OKX Routes Structure', () => {
       expect(okxConfig).toBeDefined();
       expect(okxConfig.chain).toBe('solana');
       expect(okxConfig.trading_types).toEqual(['router']);
-      expect(okxConfig.networks).toEqual(['mainnet-beta']);
+      expect(okxConfig.networks).toEqual(['mainnet-beta', 'robinhoodchain']);
 
       const connectorPath = path.join(__dirname, `../../../src/connectors/${CONNECTOR_NAME}`);
       const routerRoutesPath = path.join(connectorPath, 'router-routes');

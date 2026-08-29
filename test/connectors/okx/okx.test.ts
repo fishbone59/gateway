@@ -13,6 +13,8 @@ jest.mock('../../../src/connectors/okx/okx.config', () => ({
     chain: 'solana',
     networks: ['mainnet-beta'],
     tradingTypes: ['router'],
+    CHAIN_INDEX: { 'mainnet-beta': '501' },
+    EVM_NETWORKS: [],
     config: {
       slippagePct: 1,
       apiKey: 'test-api-key',

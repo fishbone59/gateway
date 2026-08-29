@@ -118,10 +118,10 @@ describe('OKX Schema Tests', () => {
   });
 
   describe('Field Examples and Defaults', () => {
-    it('should have Solana mainnet-only network enum', () => {
+    it('should have Solana mainnet + robinhoodchain network enum', () => {
       const networkProp = Okx.OkxQuoteSwapRequest.properties.network;
       expect(networkProp.default).toBe('mainnet-beta');
-      expect(networkProp.enum).toEqual(['mainnet-beta']);
+      expect(networkProp.enum).toEqual(['mainnet-beta', 'robinhoodchain']);
     });
   });
 });
