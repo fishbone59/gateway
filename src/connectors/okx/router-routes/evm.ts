@@ -162,12 +162,31 @@ export async function executeQuoteEvm(
     slippagePct,
   );
 
+  // OKX 的 gas 估算按主网口径，在 Orbit 链上可能严重偏低（2026-08-29 实测：OKX 估 338k，
+  // 本节点 estimateGas 1.17M，按 OKX 值发出后内层 adapter OOG 回退 "adaptor call failed"）。
+  // 取 max(OKX, 本地 estimateGas) × 1.2；本地估算失败才退回 OKX 值。
+  const value = tx.value ? BigNumber.from(tx.value) : undefined;
+  let gasLimit = tx.gas ? BigNumber.from(tx.gas).mul(120).div(100) : undefined;
+  try {
+    const est = await ethereum.provider.estimateGas({
+      from: wallet.address,
+      to: tx.to,
+      data: tx.data,
+      value,
+    });
+    const buffered = est.mul(120).div(100);
+    if (!gasLimit || buffered.gt(gasLimit)) gasLimit = buffered;
+    logger.info(`OKX EVM gas: okx=${tx.gas} local_est=${est.toString()} used=${gasLimit.toString()}`);
+  } catch (e: any) {
+    logger.warn(`OKX EVM local estimateGas failed, using OKX gas: ${e?.message || e}`);
+  }
+
   const sent = await wallet.sendTransaction({
     to: tx.to,
     data: tx.data,
-    value: tx.value ? BigNumber.from(tx.value) : undefined,
+    value,
     gasPrice: tx.gasPrice ? BigNumber.from(tx.gasPrice) : undefined,
-    gasLimit: tx.gas ? BigNumber.from(tx.gas).mul(120).div(100) : undefined,
+    gasLimit,
   });
   logger.info(`OKX EVM swap sent (waitConfirm=${waitConfirm}): ${sent.hash}`);
 
