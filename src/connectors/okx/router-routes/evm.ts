@@ -162,9 +162,10 @@ export async function executeQuoteEvm(
     slippagePct,
   );
 
-  // OKX 的 gas 估算按主网口径，在 Orbit 链上严重偏低（2026-08-29 实测 3.1×：估 338k 实际 1.17M，
+  // OKX 的 gas 估算按以太坊主网口径，在 Robinhood Chain（Arbitrum Orbit 栈 L2，gas 计量含
+  // L1 数据发布成本）上严重偏低（2026-08-29 实测 3.1×：估 338k 实际 1.17M，
   // 按 OKX 值发出后内层 adapter OOG 回退 "adaptor call failed"）。
-  // 静态 padding（用户拍板 2026-08-29）：max(okx_gas×5, 1.5M)。Orbit 未用 gas 全额退还且
+  // 静态 padding（用户拍板 2026-08-29）：max(okx_gas×5, 1.5M)。Orbit 栈未用 gas 全额退还且
   // gasPrice ~0.087 gwei，高估零成本；省掉本地 estimateGas 的 1.5-2s RPC 往返。
   // 极端多跳路由超出静态值时链上回退只亏 ~$0.0001 gas，可接受。
   const value = tx.value ? BigNumber.from(tx.value) : undefined;
