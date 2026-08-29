@@ -99,6 +99,7 @@ export const removeWalletRoute: FastifyPluginAsync = async (fastify) => {
       logger.info(`Removing wallet: ${validatedAddress} from chain: ${chain}`);
       await removeWallet(fastify, request.body);
       if (chain.toLowerCase() === 'solana') Solana.invalidateWalletCache(validatedAddress);
+      if (chain.toLowerCase() === 'ethereum') Ethereum.invalidateWalletCache(validatedAddress);
 
       return {
         message: `Wallet ${validatedAddress} removed successfully`,

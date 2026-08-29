@@ -13,6 +13,8 @@ import { Okx, OkxRouterResult } from '../okx';
 import { OkxConfig } from '../okx.config';
 import { OkxQuoteSwapRequest, OkxQuoteSwapResponse } from '../schemas';
 
+import { quoteSwapEvm } from './evm';
+
 function priceImpactPct(routerResult: OkxRouterResult): number {
   return parseFloat(routerResult.priceImpactPercent ?? routerResult.priceImpactPercentage ?? '0');
 }
@@ -26,6 +28,10 @@ export async function quoteSwap(
   slippagePct: number = OkxConfig.config.slippagePct,
   approximateIfNoExactOut: boolean = true,
 ): Promise<Static<typeof OkxQuoteSwapResponse>> {
+  // EVM networks (robinhoodchain): separate path, Solana flow below is untouched
+  if (OkxConfig.EVM_NETWORKS.includes(network)) {
+    return quoteSwapEvm(network, baseToken, quoteToken, amount, side, slippagePct);
+  }
   const solana = await Solana.getInstance(network);
   const okx = await Okx.getInstance(network);
 

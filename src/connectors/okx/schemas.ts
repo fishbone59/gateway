@@ -54,6 +54,13 @@ export const OkxQuoteSwapRequest = Type.Object({
       default: true,
     }),
   ),
+  waitConfirm: Type.Optional(
+    Type.Boolean({
+      description:
+        'true (default): wait for on-chain confirmation before returning; false: return immediately after broadcast (caller confirms). EVM path only; Solana path always confirms.',
+      default: true,
+    }),
+  ),
 });
 
 // OKX-specific quote-swap response (superset of base QuoteSwapResponse)
@@ -115,6 +122,13 @@ export const OkxExecuteQuoteRequest = Type.Object({
     description: 'ID of the OKX quote to execute',
     examples: ['123e4567-e89b-12d3-a456-426614174000'],
   }),
+  waitConfirm: Type.Optional(
+    Type.Boolean({
+      description:
+        'true (default): wait for on-chain confirmation before returning; false: return immediately after broadcast (caller confirms). EVM path only; Solana path always confirms.',
+      default: true,
+    }),
+  ),
 });
 
 // OKX-specific execute-swap request (superset of base ExecuteSwapRequest)
@@ -162,6 +176,13 @@ export const OkxExecuteSwapRequest = Type.Object({
     Type.Boolean({
       description:
         'For BUY orders when OKX cannot serve an exactOut quote: approximate via a sell-leg exactIn quote instead of failing',
+      default: true,
+    }),
+  ),
+  waitConfirm: Type.Optional(
+    Type.Boolean({
+      description:
+        'true (default): wait for on-chain confirmation before returning; false: return immediately after broadcast (caller confirms). EVM path only; Solana path always confirms.',
       default: true,
     }),
   ),

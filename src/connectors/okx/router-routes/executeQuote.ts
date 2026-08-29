@@ -6,13 +6,21 @@ import { httpErrors } from '../../../services/error-handler';
 import { logger } from '../../../services/logger';
 import { quoteCache } from '../../../services/quote-cache';
 import { Okx } from '../okx';
+import { OkxConfig } from '../okx.config';
 import { OkxExecuteQuoteRequest } from '../schemas';
+
+import { executeQuoteEvm } from './evm';
 
 export async function executeQuote(
   walletAddress: string,
   network: string,
   quoteId: string,
+  waitConfirm = true,
 ): Promise<SwapExecuteResponseType> {
+  // EVM networks (robinhoodchain): separate path, Solana flow below is untouched
+  if (OkxConfig.EVM_NETWORKS.includes(network)) {
+    return executeQuoteEvm(walletAddress, network, quoteId, waitConfirm);
+  }
   // Retrieve cached quote
   const cached = quoteCache.get(quoteId);
   if (!cached || cached.connector !== 'okx') {
@@ -82,9 +90,9 @@ export const executeQuoteRoute: FastifyPluginAsync = async (fastify) => {
     },
     async (request) => {
       try {
-        const { walletAddress, network, quoteId } = request.body as typeof OkxExecuteQuoteRequest._type;
+        const { walletAddress, network, quoteId, waitConfirm } = request.body as typeof OkxExecuteQuoteRequest._type;
 
-        return await executeQuote(walletAddress, network, quoteId);
+        return await executeQuote(walletAddress, network, quoteId, waitConfirm);
       } catch (e) {
         if (e.statusCode) throw e;
         logger.error('Error executing OKX quote:', e);

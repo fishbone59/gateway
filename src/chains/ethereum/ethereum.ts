@@ -599,10 +599,27 @@ export class Ethereum {
     }
   }
 
+  /**
+   * 解密后 Wallet 进程内缓存（本地补丁，2026-08-29，对齐 solana getWallet 缓存）：
+   * Wallet.fromEncryptedJson 的 scrypt 解密实测数百 ms，是 EVM 交易签名前的最大单笔开销。
+   * 缓存键含 network（同一地址在不同网络 connect 不同 provider）。删除钱包时经
+   * invalidateWalletCache 失效。
+   */
+  private static walletCache = new Map<string, Wallet>();
+  public static invalidateWalletCache(address: string): void {
+    for (const key of [...Ethereum.walletCache.keys()]) {
+      if (key.endsWith(`:${address}`) || key === address) Ethereum.walletCache.delete(key);
+    }
+  }
+
   public async getWallet(address: string): Promise<Wallet> {
     try {
       // Validate the address format first
       const validatedAddress = Ethereum.validateAddress(address);
+
+      const cacheKey = `${this.network}:${validatedAddress}`;
+      const cached = Ethereum.walletCache.get(cacheKey);
+      if (cached) return cached;
 
       const path = `${walletPath}/ethereum`;
       const encryptedPrivateKey = await fse.readFile(`${path}/${validatedAddress}.json`, 'utf8');
@@ -611,7 +628,9 @@ export class Ethereum {
       if (!walletKey) {
         throw new Error('Missing wallet encryption key');
       }
-      return await this.decrypt(encryptedPrivateKey, walletKey);
+      const wallet = await this.decrypt(encryptedPrivateKey, walletKey);
+      Ethereum.walletCache.set(cacheKey, wallet);
+      return wallet;
     } catch (error) {
       if (error.message.includes('Invalid Ethereum address')) {
         throw error; // Re-throw validation errors

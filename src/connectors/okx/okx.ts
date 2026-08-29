@@ -16,6 +16,19 @@ const OKX_AGGREGATOR_PATH = '/api/v6/dex/aggregator';
 // OKX chainIndex for Solana
 const SOLANA_CHAIN_INDEX = '501';
 
+// Fallback approve spenders per chainIndex (refreshed from /supported/chain at runtime)
+const FALLBACK_APPROVE_SPENDER: Record<string, string> = {
+  '4663': '0x42170295F1173c9e5874ea9d00c6d137E1a4f53d',
+};
+
+export interface OkxEvmTx {
+  to: string;
+  data: string;
+  value?: string;
+  gas?: string;
+  gasPrice?: string;
+}
+
 // Type definitions for OKX API responses
 export interface OkxRouterResult {
   fromTokenAmount: string;
@@ -46,8 +59,10 @@ interface OkxEnvelope<T> {
 export class Okx {
   private static _instances: { [name: string]: Okx };
   private solana: Solana;
+  private chainIndex: string = SOLANA_CHAIN_INDEX;
   public config: OkxConfig.RootConfig;
   private httpClient: HttpClient;
+  private approveSpenderCache?: string;
 
   private constructor() {
     this.config = OkxConfig.config;
@@ -86,6 +101,13 @@ export class Okx {
 
   private async init(network: string): Promise<void> {
     try {
+      if (OkxConfig.EVM_NETWORKS.includes(network)) {
+        this.chainIndex = OkxConfig.CHAIN_INDEX[network];
+        this.solana = null;
+        logger.info(`Initialized OKX DEX aggregator for EVM network: ${network} (chainIndex ${this.chainIndex})`);
+        return;
+      }
+      this.chainIndex = SOLANA_CHAIN_INDEX;
       this.solana = await Solana.getInstance(network);
       logger.info('Initialized OKX DEX aggregator for network:', network);
     } catch (error) {
@@ -168,7 +190,7 @@ export class Okx {
   ): Promise<OkxRouterResult> {
     logger.info(`OKX quote: ${fromMint} -> ${toMint}, amountRaw=${amountRaw}, swapMode=${swapMode}`);
     return await this.signedGet<OkxRouterResult>(`${OKX_AGGREGATOR_PATH}/quote`, {
-      chainIndex: SOLANA_CHAIN_INDEX,
+      chainIndex: this.chainIndex,
       fromTokenAddress: fromMint,
       toTokenAddress: toMint,
       amount: amountRaw,
@@ -188,7 +210,7 @@ export class Okx {
     slippagePct: number,
   ): Promise<{ routerResult: OkxRouterResult; transaction: VersionedTransaction }> {
     const params: Record<string, string> = {
-      chainIndex: SOLANA_CHAIN_INDEX,
+      chainIndex: this.chainIndex,
       fromTokenAddress: fromMint,
       toTokenAddress: toMint,
       amount: amountRaw,
@@ -211,6 +233,64 @@ export class Okx {
       routerResult: swapResult.routerResult,
       transaction: this.deserializeTransaction(swapResult.tx.data),
     };
+  }
+
+  /**
+   * Gets an executable EVM swap (route + unsigned tx fields) bound to a wallet.
+   * Returned tx fields ({to,data,value,gas,gasPrice}) are signed + broadcast by the caller.
+   */
+  async getEvmSwapTransaction(
+    walletAddress: string,
+    fromToken: string,
+    toToken: string,
+    amountRaw: string,
+    swapMode: 'exactIn' | 'exactOut',
+    slippagePct: number,
+  ): Promise<{ routerResult: OkxRouterResult; tx: OkxEvmTx }> {
+    const params: Record<string, string> = {
+      chainIndex: this.chainIndex,
+      fromTokenAddress: fromToken,
+      toTokenAddress: toToken,
+      amount: amountRaw,
+      swapMode,
+      slippagePercent: slippagePct.toString(),
+      userWalletAddress: walletAddress,
+    };
+    logger.info(`OKX EVM swap: ${fromToken} -> ${toToken}, amountRaw=${amountRaw}, wallet=${walletAddress}`);
+    const swapResult = await this.signedGet<OkxSwapResult>(`${OKX_AGGREGATOR_PATH}/swap`, params);
+    const tx = (swapResult as any).tx;
+    if (!tx?.to || !tx?.data) {
+      throw new Error('OKX EVM swap response did not include transaction fields (to/data)');
+    }
+    return { routerResult: swapResult.routerResult, tx };
+  }
+
+  /**
+   * OKX DEX approve spender for this chainIndex (cached per instance).
+   * Source: GET /supported/chain; falls back to hardcoded table on any failure.
+   */
+  async getApproveSpender(): Promise<string> {
+    if (this.approveSpenderCache) return this.approveSpenderCache;
+    try {
+      const queryString = new URLSearchParams({}).toString();
+      const path = `${OKX_AGGREGATOR_PATH}/supported/chain${queryString ? '?' + queryString : ''}`;
+      const headers = this.signedHeaders('GET', path);
+      const response = await this.httpClient.get<OkxEnvelope<any>>(path, { headers });
+      const chains = response.data?.data || [];
+      const mine = chains.find((c: any) => String(c.chainIndex) === this.chainIndex);
+      if (mine?.dexTokenApproveAddress) {
+        this.approveSpenderCache = mine.dexTokenApproveAddress;
+      }
+    } catch (error) {
+      logger.warn(`OKX /supported/chain failed, using fallback spender: ${error.message}`);
+    }
+    if (!this.approveSpenderCache) {
+      this.approveSpenderCache = FALLBACK_APPROVE_SPENDER[this.chainIndex];
+    }
+    if (!this.approveSpenderCache) {
+      throw new Error(`No OKX approve spender known for chainIndex ${this.chainIndex}`);
+    }
+    return this.approveSpenderCache;
   }
 
   /**

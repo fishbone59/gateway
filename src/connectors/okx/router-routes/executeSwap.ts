@@ -18,6 +18,7 @@ async function executeSwap(
   side: 'BUY' | 'SELL',
   slippagePct: number = OkxConfig.config.slippagePct,
   approximateIfNoExactOut: boolean = true,
+  waitConfirm: boolean = true,
 ): Promise<SwapExecuteResponseType> {
   // Step 1: Get a fresh quote
   const quoteResult = await quoteSwap(
@@ -31,7 +32,7 @@ async function executeSwap(
   );
 
   // Step 2: Execute the quote immediately
-  return await executeQuote(walletAddress, network, quoteResult.quoteId);
+  return await executeQuote(walletAddress, network, quoteResult.quoteId, waitConfirm);
 }
 
 export { executeSwap };
@@ -52,8 +53,17 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
     },
     async (request) => {
       try {
-        const { walletAddress, network, baseToken, quoteToken, amount, side, slippagePct, approximateIfNoExactOut } =
-          request.body as typeof OkxExecuteSwapRequest._type;
+        const {
+          walletAddress,
+          network,
+          baseToken,
+          quoteToken,
+          amount,
+          side,
+          slippagePct,
+          approximateIfNoExactOut,
+          waitConfirm,
+        } = request.body as typeof OkxExecuteSwapRequest._type;
 
         return await executeSwap(
           walletAddress,
@@ -64,6 +74,7 @@ export const executeSwapRoute: FastifyPluginAsync = async (fastify) => {
           side as 'BUY' | 'SELL',
           slippagePct,
           approximateIfNoExactOut,
+          waitConfirm,
         );
       } catch (e) {
         if (e.statusCode) throw e;

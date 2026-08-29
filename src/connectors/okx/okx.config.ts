@@ -2,10 +2,20 @@ import { AvailableNetworks } from '../../services/base';
 import { ConfigManagerV2 } from '../../services/config-manager-v2';
 
 export namespace OkxConfig {
-  // The OKX DEX aggregator connector targets Solana mainnet (chainIndex 501)
+  // The OKX DEX aggregator connector: Solana mainnet (chainIndex 501) + EVM networks
+  // (robinhoodchain = chainIndex 4663, local patch 2026-08-29).
   export const chain = 'solana';
-  export const networks = ['mainnet-beta'];
+  export const networks = ['mainnet-beta', 'robinhoodchain'];
   export type Network = string;
+
+  // network -> OKX chainIndex
+  export const CHAIN_INDEX: Record<string, string> = {
+    'mainnet-beta': '501',
+    robinhoodchain: '4663',
+  };
+
+  // EVM networks served by this connector (all others are treated as Solana)
+  export const EVM_NETWORKS = ['robinhoodchain'];
 
   // Supported trading types
   export const tradingTypes = ['router'] as const;
